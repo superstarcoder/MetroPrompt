@@ -9,6 +9,12 @@ export const TILE_RENDER: Record<string, RenderOffset> = {
   crosswalk:    { offsetX: 0, offsetY: -15, scale: 1.0 },
   sidewalk:     { offsetX: 2, offsetY: -19, scale: 1.2 },
   pavement:     { offsetX: 0, offsetY: -19, scale: 1.2 },
+  flower_patch_v1: { offsetX: 0, offsetY: -15, scale: 1.0 },
+  bush_v1:         { offsetX: 0, offsetY: -15, scale: 1.0 },
+  tree_v1:         { offsetX: 0, offsetY: -32, scale: 1.2 },
+  tree_v2:         { offsetX: 0, offsetY: -20, scale: 1.0 },
+  tree_v3:         { offsetX: 0, offsetY: -20, scale: 1.0 },
+  tree_v4:         { offsetX: 0, offsetY: -23, scale: 1.0 },
 };
 
 export const PROP_RENDER: Record<string, RenderOffset> = {
@@ -18,9 +24,13 @@ export const PROP_RENDER: Record<string, RenderOffset> = {
   grocery_store: { offsetX: -1, offsetY: 9, scale: 0.9 }, // Manually adjusted, do not change without testing
   fire_station:  { offsetX: -1, offsetY: -10, scale: 0.97 },
   police_station:{ offsetX: 0, offsetY: -7, scale: 1 },
-  power_plant:   { offsetX: 0, offsetY: -24, scale: 1 },
-  apartment:     { offsetX: 0, offsetY: -31, scale: 1.1 },
-  restaurant:    { offsetX: 0, offsetY: 10, scale: 1.0 }, // Manually adjusted, do not change without testing
-  house_v1:      { offsetX: -1, offsetY: -48, scale: 2 },
-  house_v2:      { offsetX: 5, offsetY: -25, scale: 1.1 }, // Manually adjusted, do not change without testing
+  powerplant:    { offsetX: 0, offsetY: -25, scale: 1 },
+  apartment_v1:  { offsetX: 0, offsetY: -79, scale: 1.3 },
+  apartment_v2:  { offsetX: 0, offsetY: -45, scale: 1.1 },
+  office_v1:     { offsetX: 0, offsetY: -96, scale: 1.37 },
+  office_v2:     { offsetX: 0, offsetY: -108, scale: 1.5 },
+  office_v3:     { offsetX: 0, offsetY: -105, scale: 1.4 },
+  restaurant:    { offsetX: 0, offsetY: -25, scale: 1.0 }, // Manually adjusted, do not change without testing
+  home_v1:       { offsetX: -1, offsetY: -48, scale: 2 },
+  home_v2:       { offsetX: 5, offsetY: -25, scale: 1.1 }, // Manually adjusted, do not change without testing
 };
