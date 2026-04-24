@@ -414,6 +414,28 @@ export const placeTile = (city: City, x: number, y: number, name: TileName): voi
   city.tile_grid[y][x] = TILE_CODES[name];
 };
 
+export const placeTileRect = (
+  city: City,
+  x1: number, y1: number,
+  x2: number, y2: number,
+  name: TileName,
+): void => {
+  const xLo = Math.min(x1, x2), xHi = Math.max(x1, x2);
+  const yLo = Math.min(y1, y2), yHi = Math.max(y1, y2);
+  const gridH = city.tile_grid.length;
+  const gridW = city.tile_grid[0]?.length ?? 0;
+  if (xLo < 0 || yLo < 0 || xHi >= gridW || yHi >= gridH) {
+    throw new Error(
+      `placeTileRect: '${name}' rect (${xLo},${yLo})-(${xHi},${yHi}) extends out of bounds (grid ${gridW}x${gridH})`
+    );
+  }
+  for (let y = yLo; y <= yHi; y++) {
+    for (let x = xLo; x <= xHi; x++) {
+      city.tile_grid[y][x] = TILE_CODES[name];
+    }
+  }
+};
+
 export const placeProperty = (city: City, property: Property): void => {
   const gridH = city.tile_grid.length;
   const gridW = city.tile_grid[0]?.length ?? 0;

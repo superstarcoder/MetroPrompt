@@ -1,0 +1,144 @@
+import {
+  PROPERTY_DEFAULTS,
+  TILE_META,
+  placeProperty,
+  placeTileRect,
+} from '../all_types';
+import type { City, PropertyName, TileName } from '../all_types';
+
+// ============================================================
+// TOOL CALL SHAPES
+// ============================================================
+// Mirrors Anthropic tool_use block shape: { name, input }.
+// LLM never sees the City object — it sees an observation string and
+// emits these, which we dispatch into city-mutating handlers.
+
+export type ToolCall =
+  | { name: 'place_property'; input: { property: PropertyName; x: number; y: number } }
+  | { name: 'place_tile_rect'; input: { tile: TileName; x1: number; y1: number; x2: number; y2: number } }
+  | { name: 'finish'; input: { reason: string } };
+
+export type ToolResult =
+  | { ok: true; done?: boolean }
+  | { ok: false; error: string };
+
+// ============================================================
+// HANDLERS
+// ============================================================
+
+function handlePlaceProperty(
+  city: City,
+  args: { property: PropertyName; x: number; y: number },
+): ToolResult {
+  const def = PROPERTY_DEFAULTS[args.property];
+  if (!def) {
+    return {
+      ok: false,
+      error: `place_property: unknown property '${args.property}'. Valid: ${Object.keys(PROPERTY_DEFAULTS).join(', ')}`,
+    };
+  }
+  try {
+    placeProperty(city, {
+      ...def,
+      position: { x: args.x, y: args.y },
+      current_occupants: [],
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+function handlePlaceTileRect(
+  city: City,
+  args: { tile: TileName; x1: number; y1: number; x2: number; y2: number },
+): ToolResult {
+  if (!TILE_META[args.tile]) {
+    return {
+      ok: false,
+      error: `place_tile_rect: unknown tile '${args.tile}'. Valid: ${Object.keys(TILE_META).join(', ')}`,
+    };
+  }
+  try {
+    placeTileRect(city, args.x1, args.y1, args.x2, args.y2, args.tile);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+function handleFinish(_city: City, _args: { reason: string }): ToolResult {
+  return { ok: true, done: true };
+}
+
+// ============================================================
+// DISPATCHER
+// ============================================================
+
+export function applyToolCall(city: City, call: ToolCall): ToolResult {
+  switch (call.name) {
+    case 'place_property':  return handlePlaceProperty(city, call.input);
+    case 'place_tile_rect': return handlePlaceTileRect(city, call.input);
+    case 'finish':          return handleFinish(city, call.input);
+  }
+}
+
+// Convenience: apply a batch, collect per-call results. Does NOT short-circuit
+// on error — the Mayor should see every failure in the next observation.
+export function applyBatch(
+  city: City,
+  calls: ToolCall[],
+): Array<{ call: ToolCall; result: ToolResult }> {
+  return calls.map(call => ({ call, result: applyToolCall(city, call) }));
+}
+
+// ============================================================
+// TOOL SCHEMAS (Anthropic SDK shape)
+// ============================================================
+
+export const TOOL_SCHEMAS = [
+  {
+    name: 'place_property',
+    description:
+      'Place a single building anchored at (x, y). The footprint extends down-right from the anchor. ' +
+      '3x3 buildings: park, hospital, school, grocery_store, apartment, office, fire_station, police_station, power_plant, shopping_mall, theme_park. ' +
+      '2x2 buildings: house, restaurant. ' +
+      'Footprints must fit in-bounds and must not overlap any existing building.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        property: { type: 'string', enum: Object.keys(PROPERTY_DEFAULTS) },
+        x: { type: 'integer', minimum: 0 },
+        y: { type: 'integer', minimum: 0 },
+      },
+      required: ['property', 'x', 'y'],
+    },
+  },
+  {
+    name: 'place_tile_rect',
+    description:
+      'Fill an axis-aligned rectangle of ground tiles (both corners inclusive). ' +
+      'Use for roads, sidewalks, pavement, crosswalks. Later calls overwrite earlier ones. ' +
+      'A single cell is (x1==x2, y1==y2).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        tile: { type: 'string', enum: Object.keys(TILE_META) },
+        x1: { type: 'integer', minimum: 0 },
+        y1: { type: 'integer', minimum: 0 },
+        x2: { type: 'integer', minimum: 0 },
+        y2: { type: 'integer', minimum: 0 },
+      },
+      required: ['tile', 'x1', 'y1', 'x2', 'y2'],
+    },
+  },
+  {
+    name: 'finish',
+    description: 'Signal the city is complete. Include a one-sentence rationale.',
+    input_schema: {
+      type: 'object',
+      properties: { reason: { type: 'string' } },
+      required: ['reason'],
+    },
+  },
+] as const;
