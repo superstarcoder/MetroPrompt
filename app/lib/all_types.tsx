@@ -8,7 +8,7 @@ export type Position = {
 };
 
 // ============================================================
-// TILE TYPES
+// TILE TYPES (ground layer only — stored as chars in City.tile_grid)
 // ============================================================
 
 export type TileName =
@@ -20,77 +20,22 @@ export type TileName =
   | "sidewalk"
   | "grass";
 
-export type Tile = {
-  name: TileName;
+export const TILE_META: Record<TileName, {
   can_walk_through: boolean;
   can_drive_through: boolean;
-  position: Position;
-  width: number;
-  height: number;
   image: string;
-};
-
-export const TILE_DEFAULTS: Record<TileName, Omit<Tile, "position">> = {
-  pavement: {
-    name: "pavement",
-    can_walk_through: true,
-    can_drive_through: false,
-    width: 1,
-    height: 1,
-    image: "/assets/pavement_1_1.png",
-  },
-  road_one_way: {
-    name: "road_one_way",
-    can_walk_through: false,
-    can_drive_through: true,
-    width: 1,
-    height: 1,
-    image: "/assets/road_1_1.png",
-  },
-  road_two_way: {
-    name: "road_two_way",
-    can_walk_through: false,
-    can_drive_through: true,
-    width: 1,
-    height: 1,
-    image: "/assets/road_1_1.png",
-  },
-  road_intersection: {
-    name: "road_intersection",
-    can_walk_through: false,
-    can_drive_through: true,
-    width: 1,
-    height: 1,
-    image: "/assets/intersection_1_1.png",
-  },
-  crosswalk: {
-    name: "crosswalk",
-    can_walk_through: true,
-    can_drive_through: true,
-    width: 1,
-    height: 1,
-    image: "/assets/crosswalk_1_1.png",
-  },
-  sidewalk: {
-    name: "sidewalk",
-    can_walk_through: true,
-    can_drive_through: false,
-    width: 1,
-    height: 1,
-    image: "/assets/sidewalk_1_1.png",
-  },
-  grass: {
-    name: "grass",
-    can_walk_through: true,
-    can_drive_through: false,
-    width: 1,
-    height: 1,
-    image: "/assets/grass_1_1.png",
-  },
+}> = {
+  pavement:          { can_walk_through: true,  can_drive_through: false, image: "/assets/pavement_1_1.png" },
+  road_one_way:      { can_walk_through: false, can_drive_through: true,  image: "/assets/road_1_1.png" },
+  road_two_way:      { can_walk_through: false, can_drive_through: true,  image: "/assets/road_1_1.png" },
+  road_intersection: { can_walk_through: false, can_drive_through: true,  image: "/assets/intersection_1_1.png" },
+  crosswalk:         { can_walk_through: true,  can_drive_through: true,  image: "/assets/crosswalk_1_1.png" },
+  sidewalk:          { can_walk_through: true,  can_drive_through: false, image: "/assets/sidewalk_1_1.png" },
+  grass:             { can_walk_through: true,  can_drive_through: false, image: "/assets/grass_1_1.png" },
 };
 
 // ============================================================
-// PROPERTY TYPES
+// PROPERTY TYPES (buildings — live in City.all_properties)
 // ============================================================
 
 export type PropertyName =
@@ -123,8 +68,19 @@ export type Property = {
 };
 
 export const HOUSE_IMAGES = [
-  "/assets/home_v1_1_1.png",
+  "/assets/home_v1_2_2.png",
   "/assets/home_v2_2_2.png",
+];
+
+export const APARTMENT_IMAGES = [
+  "/assets/apartment_v1_3_3.png",
+  "/assets/apartment_v2_3_3.png",
+];
+
+export const OFFICE_IMAGES = [
+  "/assets/office_v1_3_3.png",
+  "/assets/office_v2_3_3.png",
+  "/assets/office_v3_3_3.png",
 ];
 
 export const TREE_IMAGES = [
@@ -140,29 +96,6 @@ export const FLOWER_PATCH_IMAGES = [
 
 export const BUSH_IMAGES = [
   "/assets/bush_v1_1_1.png",
-];
-
-// ============================================================
-// NATURE TYPES
-// ============================================================
-
-export type NatureName = "tree" | "flower_patch" | "bush";
-
-export type Nature = {
-  name: NatureName;
-  position: Position;
-  image: string;
-};
-
-export const APARTMENT_IMAGES = [
-  "/assets/apartment_v1_3_3.png",
-  "/assets/apartment_v2_3_3.png",
-];
-
-export const OFFICE_IMAGES = [
-  "/assets/office_v1_3_3.png",
-  "/assets/office_v2_3_3.png",
-  "/assets/office_v3_3_3.png",
 ];
 
 export const PROPERTY_DEFAULTS: Record<PropertyName, Omit<Property, "position" | "current_occupants">> = {
@@ -312,6 +245,69 @@ export const PROPERTY_DEFAULTS: Record<PropertyName, Omit<Property, "position" |
 };
 
 // ============================================================
+// NATURE TYPES (trees / flowers / bushes — live in City.all_nature)
+// ============================================================
+
+export type NatureName = "tree" | "flower_patch" | "bush";
+
+export type Nature = {
+  name: NatureName;
+  position: Position;
+  image: string;
+};
+
+// ============================================================
+// TILE CODES (single-char codes — LLM-facing + grid storage)
+// ============================================================
+
+export const TILE_CODES = {
+  grass: ".",
+  pavement: ",",
+  road_one_way: "-",
+  road_two_way: "=",
+  road_intersection: "+",
+  crosswalk: "x",
+  sidewalk: "_",
+} as const satisfies Record<TileName, string>;
+
+export const NATURE_CODES = {
+  tree: "t",
+  flower_patch: "f",
+  bush: "b",
+} as const satisfies Record<NatureName, string>;
+
+export const PROPERTY_CODES = {
+  house: "D",
+  apartment: "A",
+  office: "O",
+  restaurant: "R",
+  park: "P",
+  school: "S",
+  grocery_store: "G",
+  hospital: "H",
+  fire_station: "F",
+  police_station: "C",
+  power_plant: "E",
+  shopping_mall: "M",
+  theme_park: "Z",
+} as const satisfies Record<PropertyName, string>;
+
+export type TileCode =
+  | typeof TILE_CODES[keyof typeof TILE_CODES]
+  | typeof NATURE_CODES[keyof typeof NATURE_CODES]
+  | typeof PROPERTY_CODES[keyof typeof PROPERTY_CODES];
+
+export const CODE_TO_TILE: Record<string, TileName> = Object.fromEntries(
+  Object.entries(TILE_CODES).map(([name, code]) => [code, name as TileName])
+);
+export const CODE_TO_NATURE: Record<string, NatureName> = Object.fromEntries(
+  Object.entries(NATURE_CODES).map(([name, code]) => [code, name as NatureName])
+);
+export const CODE_TO_PROPERTY: Record<string, PropertyName> = Object.fromEntries(
+  Object.entries(PROPERTY_CODES).map(([name, code]) => [code, name as PropertyName])
+);
+
+// ============================================================
 // PEOPLE TYPES
 // ============================================================
 
@@ -385,41 +381,28 @@ export const spawnPerson = (
 });
 
 // ============================================================
-// GRID CELL TYPE
-// ============================================================
-
-export type GridCell =
-  | { kind: "tile"; data: Tile }
-  | { kind: "property"; data: Property }
-  | null;
-
-// ============================================================
 // CITY TYPE
 // ============================================================
 
 export type City = {
-  city_grid: GridCell[][];
+  tile_grid: TileCode[][];       // ground layer; every cell defaults to grass
+  all_properties: Property[];    // buildings (anchor + variant + occupants)
+  all_nature: Nature[];          // trees / flowers / bushes
   all_citizens: Person[];
-  all_properties: Property[];
-  day: number; // 1–7
+  day: number;                   // 1–7
 };
 
 // ============================================================
 // CITY INITIALIZATION
 // ============================================================
 
-export const initCity = (): City => ({
-  city_grid: Array.from({ length: 500 }, (_, y) =>
-    Array.from({ length: 500 }, (_, x) => ({
-      kind: "tile",
-      data: {
-        ...TILE_DEFAULTS.grass,
-        position: { x, y },
-      },
-    }))
+export const initCity = (size: number = 500): City => ({
+  tile_grid: Array.from({ length: size }, () =>
+    Array.from({ length: size }, (): TileCode => TILE_CODES.grass)
   ),
-  all_citizens: [],
   all_properties: [],
+  all_nature: [],
+  all_citizens: [],
   day: 1,
 });
 
@@ -427,25 +410,183 @@ export const initCity = (): City => ({
 // GRID HELPERS
 // ============================================================
 
-export const placeTile = (city: City, tile: Tile): void => {
-  city.city_grid[tile.position.y][tile.position.x] = {
-    kind: "tile",
-    data: tile,
-  };
+export const placeTile = (city: City, x: number, y: number, name: TileName): void => {
+  city.tile_grid[y][x] = TILE_CODES[name];
 };
 
 export const placeProperty = (city: City, property: Property): void => {
-  for (let dy = 0; dy < property.height; dy++) {
-    for (let dx = 0; dx < property.width; dx++) {
-      city.city_grid[property.position.y + dy][property.position.x + dx] = {
-        kind: "property",
-        data: property,
-      };
+  const gridH = city.tile_grid.length;
+  const gridW = city.tile_grid[0]?.length ?? 0;
+  const { x: px, y: py } = property.position;
+  const { width: pw, height: ph, name } = property;
+
+  if (px < 0 || py < 0 || px + pw > gridW || py + ph > gridH) {
+    throw new Error(
+      `placeProperty: '${name}' at (${px},${py}) ${pw}x${ph} extends out of bounds (grid ${gridW}x${gridH})`
+    );
+  }
+
+  for (const p of city.all_properties) {
+    const overlaps =
+      px < p.position.x + p.width &&
+      px + pw > p.position.x &&
+      py < p.position.y + p.height &&
+      py + ph > p.position.y;
+    if (overlaps) {
+      throw new Error(
+        `placeProperty: '${name}' at (${px},${py}) ${pw}x${ph} overlaps existing '${p.name}' at (${p.position.x},${p.position.y}) ${p.width}x${p.height}`
+      );
     }
   }
+
   city.all_properties.push(property);
 };
 
-export const getCellAt = (city: City, position: Position): GridCell => {
-  return city.city_grid[position.y][position.x];
+export const placeNature = (city: City, nature: Nature): void => {
+  city.all_nature.push(nature);
 };
+
+export const getTileAt = (city: City, position: Position): TileName => {
+  return CODE_TO_TILE[city.tile_grid[position.y][position.x]];
+};
+
+export const getPropertyAt = (city: City, position: Position): Property | undefined => {
+  return city.all_properties.find(p =>
+    position.x >= p.position.x && position.x < p.position.x + p.width &&
+    position.y >= p.position.y && position.y < p.position.y + p.height
+  );
+};
+
+// ============================================================
+// LLM VIEW — single char per cell, readable ASCII map
+// ============================================================
+
+export const ASCII_LEGEND = `Legend:
+  Ground:      . grass   , pavement   - road_one_way   = road_two_way   + intersection   x crosswalk   _ sidewalk
+  Nature:      t tree    f flower_patch   b bush
+  Buildings (uppercase):
+    D house (2x2)          A apartment (3x3)      O office (3x3)
+    R restaurant (2x2)     P park (3x3)           S school (3x3)
+    G grocery_store (3x3)  H hospital (3x3)       F fire_station (3x3)
+    C police_station (3x3) E power_plant (3x3)    M shopping_mall (3x3)
+    Z theme_park (3x3)`;
+
+export function cityToAscii(city: City): { grid: string; legend: string } {
+  const rows: string[][] = city.tile_grid.map(r => [...r]);
+  for (const n of city.all_nature) {
+    if (rows[n.position.y] && rows[n.position.y][n.position.x] !== undefined) {
+      rows[n.position.y][n.position.x] = NATURE_CODES[n.name];
+    }
+  }
+  for (const p of city.all_properties) {
+    for (let dy = 0; dy < p.height; dy++) {
+      for (let dx = 0; dx < p.width; dx++) {
+        const y = p.position.y + dy;
+        const x = p.position.x + dx;
+        if (rows[y] && rows[y][x] !== undefined) {
+          rows[y][x] = PROPERTY_CODES[p.name];
+        }
+      }
+    }
+  }
+  return {
+    grid: rows.map(r => r.join("")).join("\n"),
+    legend: ASCII_LEGEND,
+  };
+}
+
+// ============================================================
+// LLM VIEW (inverse) — parse ASCII grid back into a City
+// ============================================================
+
+export type AsciiToCityOptions = {
+  // How to pick images for nature/property variants (ASCII loses variant info).
+  // 'default' → always use PROPERTY_DEFAULTS[name].image and *_IMAGES[0] for nature (deterministic, SSR-safe)
+  // 'random'  → pick a random variant (client-only; do NOT call at module load)
+  variantStrategy?: "default" | "random";
+};
+
+function pickNatureImage(name: NatureName, strategy: "default" | "random"): string {
+  const arr =
+    name === "tree" ? TREE_IMAGES :
+    name === "flower_patch" ? FLOWER_PATCH_IMAGES :
+    BUSH_IMAGES;
+  return strategy === "random" ? arr[Math.floor(Math.random() * arr.length)] : arr[0];
+}
+
+function pickPropertyImage(name: PropertyName, strategy: "default" | "random"): string {
+  if (strategy !== "random") return PROPERTY_DEFAULTS[name].image;
+  const arr =
+    name === "house" ? HOUSE_IMAGES :
+    name === "apartment" ? APARTMENT_IMAGES :
+    name === "office" ? OFFICE_IMAGES :
+    null;
+  return arr ? arr[Math.floor(Math.random() * arr.length)] : PROPERTY_DEFAULTS[name].image;
+}
+
+export function asciiToCity(ascii: string, opts?: AsciiToCityOptions): City {
+  const strategy = opts?.variantStrategy ?? "default";
+
+  const raw = ascii.split("\n");
+  const rows = raw.length > 0 && raw[raw.length - 1] === "" ? raw.slice(0, -1) : raw;
+  if (rows.length === 0) throw new Error("asciiToCity: empty input");
+  const width = rows[0].length;
+  for (let y = 0; y < rows.length; y++) {
+    if (rows[y].length !== width) {
+      throw new Error(`asciiToCity: ragged row at y=${y} (len ${rows[y].length} vs expected ${width})`);
+    }
+  }
+  const height = rows.length;
+
+  const city = initCity(Math.max(width, height));
+  const visited: boolean[][] = Array.from({ length: height }, () => new Array(width).fill(false));
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (visited[y][x]) continue;
+      const ch = rows[y][x];
+
+      if (ch in CODE_TO_TILE) {
+        placeTile(city, x, y, CODE_TO_TILE[ch]);
+        visited[y][x] = true;
+      } else if (ch in CODE_TO_NATURE) {
+        const name = CODE_TO_NATURE[ch];
+        placeNature(city, { name, position: { x, y }, image: pickNatureImage(name, strategy) });
+        visited[y][x] = true;
+      } else if (ch in CODE_TO_PROPERTY) {
+        const name = CODE_TO_PROPERTY[ch];
+        const { width: pw, height: ph } = PROPERTY_DEFAULTS[name];
+        for (let dy = 0; dy < ph; dy++) {
+          for (let dx = 0; dx < pw; dx++) {
+            const xx = x + dx;
+            const yy = y + dy;
+            if (yy >= height || xx >= width) {
+              throw new Error(`asciiToCity: '${ch}' at (${x},${y}) expects ${pw}x${ph} footprint but extends past grid at (${xx},${yy})`);
+            }
+            if (rows[yy][xx] !== ch) {
+              throw new Error(`asciiToCity: '${ch}' at (${x},${y}) expects ${pw}x${ph} footprint of '${ch}' but (${xx},${yy}) is '${rows[yy][xx]}'`);
+            }
+            if (visited[yy][xx]) {
+              throw new Error(`asciiToCity: '${ch}' at (${x},${y}) overlaps previously-consumed cell (${xx},${yy})`);
+            }
+          }
+        }
+        placeProperty(city, {
+          ...PROPERTY_DEFAULTS[name],
+          image: pickPropertyImage(name, strategy),
+          position: { x, y },
+          current_occupants: [],
+        });
+        for (let dy = 0; dy < ph; dy++) {
+          for (let dx = 0; dx < pw; dx++) {
+            visited[y + dy][x + dx] = true;
+          }
+        }
+      } else {
+        throw new Error(`asciiToCity: unknown char '${ch}' at (${x},${y})`);
+      }
+    }
+  }
+
+  return city;
+}

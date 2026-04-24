@@ -44,7 +44,7 @@ MetroPrompt/
 ## Agent Architecture
 - **Mayor agent** — high-level city goals, population targets, happiness metrics, reacts to simulation feedback
 - **Zone agents** — place `Property` objects (residential, commercial, civic)
-- **Infrastructure agents** — lay `Tile` objects (roads, sidewalks, crosswalks)
+- **Infrastructure agents** — lay ground tiles (roads, sidewalks, crosswalks) via `place_tile(name, x, y)`
 - Agents communicate exclusively via **tool calls** (e.g. `place_property(name, x, y)`, `place_tile(name, x, y)`, `spawn_citizen(home_property_id)`)
 
 ## Build Stages
@@ -65,18 +65,16 @@ gridToScreen(gx, gy) = {
 ```
 
 ### Two-pass render (current approach)
-1. **Pass 1 — tiles.** Every grid cell's tile texture is drawn as the ground layer. Tiles under property footprints are NOT skipped — they simply get covered by the building in pass 2.
-2. **Pass 2 — nature + properties**, iterated in nested `(gy, gx)` order. For each cell: draw nature if one is keyed there, then draw a property if its anchor (top corner) is at that cell.
+1. **Pass 1 — tiles.** Iterate `city.tile_grid`, decode char via `CODE_TO_TILE`, look up image via `TILE_META[name].image`, draw. Every cell has a ground tile (default grass); buildings sit on top in pass 2 without modifying the tile grid.
+2. **Pass 2 — nature + properties.** Merge `city.all_nature` and `city.all_properties` into a combined drawables list, sort by `position.x + position.y` (painter's-algorithm depth), then draw in order. Nature is 1×1 at its position; properties anchor at their top corner and draw with width `prop.width * TILE_W * cfg.scale`.
 
-The nested `(gy, gx)` iteration doubles as a painter's-algorithm sort: larger `gy+gx` ⇒ lower on screen ⇒ drawn later ⇒ on top. Since properties anchor at their back corner and nature is only spawned on unoccupied grass cells, occlusion works for the current test layouts without an explicit depth sort.
-
-If future layouts get denser (taller buildings, overlapping footprints, nature between buildings), revisit this — a true unified depth-sorted pass may be needed.
+Because properties anchor at their back corner and the painter's sort uses that anchor, occlusion works for the current test layouts. If future layouts get denser (taller buildings, overlapping footprints), revisit the sort key — may need `max(x+y) - property-depth` or similar.
 
 ### Tile rendering
 - `anchor.set(0.5, 0)` — top vertex of diamond pinned to grid position
 - Scale: `(TILE_W / texture.width) * cfg.scale`
-- Offsets per tile type stored in `lib/renderConfig.ts` (`TILE_RENDER`)
-- Texture lookup in `CityRenderer.tsx` uses a hardcoded `TILE_TEXTURES` map keyed by **the test scene's simplified tile names** (`grass`, `road`, `sidewalk`, `pavement`, `crosswalk`, `intersection`) — these do not match the full `TileName` union in `all_types.tsx` (`road_one_way`, `road_two_way`, `road_intersection`, etc.). Reconcile when connecting real agent output.
+- Offsets per tile type stored in `lib/renderConfig.ts` (`TILE_RENDER`) — keys match `TileName` exactly (`grass`, `road_one_way`, `road_two_way`, `road_intersection`, `crosswalk`, `sidewalk`, `pavement`)
+- Texture path resolved via `TILE_META[CODE_TO_TILE[char]].image` — single source of truth in `all_types.tsx`
 
 ### Nature rendering
 - `Nature` items (`tree`, `flower_patch`, `bush`) are randomly spawned inside `init()` on grass cells that aren't occupied by a property (~4% tree, ~4% flower_patch, ~2% bush).
@@ -90,9 +88,9 @@ If future layouts get denser (taller buildings, overlapping footprints, nature b
 - **Placement convention:** `(gx, gy)` = top corner of diamond footprint. A 3×3 property at (0,0) occupies cells (0,0)–(2,2).
 
 ### Texture loading
-- Tile textures keyed by image path — `tileTex['/assets/grass_1_1.png']`
-- Property textures keyed by image path — `propTex['/assets/apartment_v1_3_3.png']`
-- Nature textures keyed by image path — `natureTex['/assets/tree_v3_1_1.png']`
+- Tile textures keyed by image path — `tileTex['/assets/grass_1_1.png']`, collected from `Object.values(TILE_META).map(m => m.image)`
+- Property textures keyed by image path — `propTex['/assets/apartment_v1_3_3.png']`, collected from `city.all_properties`
+- Nature textures keyed by image path — `natureTex['/assets/tree_v3_1_1.png']`, collected from `city.all_nature`
 - All unique paths collected upfront and loaded in parallel via `Assets.load`
 
 ### Test scene layout (`CityRenderer.tsx`)
@@ -113,7 +111,7 @@ If future layouts get denser (taller buildings, overlapping footprints, nature b
 Separates visual tuning from game logic. Contains per-sprite `{ offsetX, offsetY, scale }` for all tile, nature, and property render keys. Edit this file to adjust sprite alignment without touching the schema or renderer logic.
 
 Keys use the sprite variant name (same as what `renderKey()` derives from the image path):
-- Tile keys: `grass`, `road`, `road_one_way`, `road_two_way`, `intersection`, `crosswalk`, `sidewalk`, `pavement`
+- Tile keys: `grass`, `road_one_way`, `road_two_way`, `road_intersection`, `crosswalk`, `sidewalk`, `pavement` — match `TileName` exactly
 - Nature keys: `tree_v1`–`tree_v4`, `flower_patch_v1`, `bush_v1`
 - Property keys: `park`, `hospital`, `school`, `grocery_store`, `fire_station`, `police_station`, `powerplant`, `restaurant`, `shopping_mall`, `theme_park`, `apartment_v1`, `apartment_v2`, `office_v1`–`office_v3`, `home_v1`, `home_v2` (note: `home_`, not `house_` — matches image filenames; the `powerplant` key also differs from the `power_plant` property name)
 
@@ -123,7 +121,7 @@ All types and constants are exported. Import via `@/lib/all_types`.
 ### Tiles (`TileName`)
 `pavement`, `road_one_way`, `road_two_way`, `road_intersection`, `crosswalk`, `sidewalk`, `grass`
 
-`Tile = { name, can_walk_through, can_drive_through, position, width, height, image }`. `TILE_DEFAULTS` provides `Omit<Tile, "position">` for each name.
+Tiles have no per-instance state — they live in `city.tile_grid: TileCode[][]` as single-char codes. `TILE_META[name]` provides the per-name `{ can_walk_through, can_drive_through, image }` used by rendering and (eventually) pathfinding. There is no `Tile` object type anymore.
 
 ### Nature (`NatureName`) — separate from tiles
 `tree`, `flower_patch`, `bush`. `Nature = { name, position, image }` — no walkability flags (enforced by rendering / pathfinding).
@@ -158,7 +156,7 @@ Variant image arrays:
 - `OFFICE_IMAGES` — `office_v1_3_3.png`, `office_v2_3_3.png`, `office_v3_3_3.png`
 
 ### Important: no Math.random() at module level
-`PROPERTY_DEFAULTS` and `TILE_DEFAULTS` use index `[0]` for variant properties. Random variant selection happens at construction time (in helpers like `apt()`, `office()`, and the nature-spawn loop inside `init()`), never at module evaluation time — doing so causes React hydration mismatches.
+`PROPERTY_DEFAULTS` uses index `[0]` for variant buildings. Random variant selection happens at construction time (in helpers like `apt()`, `office()`, and the nature-spawn loop inside `init()`), never at module evaluation time — doing so causes React hydration mismatches.
 
 ### People (`Person`)
 `name`, `age_group` (`adult`/`child`), `job` (see `Job` union, `null` for children), `home: Property`, `current_location: Position`, `current_path: Position[]`, `inside_property: Property | null`, needs `hunger`/`boredom`/`tiredness` (1–10) with per-person decay rates `hunger_rate` (1.5–4.5), `boredom_rate`/`tiredness_rate` (1.0–4.0), plus `image`.
@@ -168,13 +166,42 @@ Helpers:
 - `randomBetween(min, max)`
 - `spawnPerson(age_group, home, availableImages)` — assigns random job (null for children), randomized needs/rates, picks image from supplied list. Depends on an external `generateRandomName()` (declared, not yet implemented).
 
-### Grid and City
-- `GridCell = { kind: "tile"; data: Tile } | { kind: "property"; data: Property } | null` — discriminated union
-- `City = { city_grid: GridCell[][], all_citizens: Person[], all_properties: Property[], day: number /* 1–7 */ }`
-- `initCity()` — returns a 500×500 all-grass city
-- `placeTile(city, tile)` — writes to `city_grid[y][x]`
-- `placeProperty(city, property)` — writes the property across its footprint and pushes to `all_properties`
-- `getCellAt(city, position)` — reads `city_grid[y][x]`
+### Grid and City — three-list design
+`City` is a flat tile grid plus parallel lists for buildings, nature, and citizens. The tile grid stores only ground chars; buildings and nature live in their own lists keyed by anchor position. This keeps storage compact, matches the renderer's natural iteration, and makes a single char grid the source of truth for the LLM-facing ASCII view.
+
+```ts
+City = {
+  tile_grid: TileCode[][];    // ground layer; every cell defaults to '.' (grass)
+  all_properties: Property[]; // buildings (anchor + variant + occupants)
+  all_nature: Nature[];       // trees / flowers / bushes
+  all_citizens: Person[];
+  day: number;                // 1–7
+}
+```
+
+Helpers (all in `all_types.tsx`):
+- `initCity(size = 500)` — all-grass grid, empty lists. `size` is parameterized so the renderer's test scene can use 50×50.
+- `placeTile(city, x, y, name: TileName)` — sets `tile_grid[y][x] = TILE_CODES[name]`.
+- `placeProperty(city, property)` — pushes to `all_properties`. Does **not** touch `tile_grid`; buildings sit on grass by convention.
+- `placeNature(city, nature)` — pushes to `all_nature`. Does not touch `tile_grid`.
+- `getTileAt(city, position): TileName` — decodes via `CODE_TO_TILE`.
+- `getPropertyAt(city, position): Property | undefined` — O(n) scan over `all_properties` for a footprint covering `position`.
+
+### TileCode — single-char codes
+`TILE_CODES`, `NATURE_CODES`, `PROPERTY_CODES` are the forward maps (name → char). `CODE_TO_TILE`, `CODE_TO_NATURE`, `CODE_TO_PROPERTY` are their inverses. Uppercase = buildings, lowercase = nature, symbols = ground tiles. `H` = hospital (universal map convention); house is `D`.
+
+| Ground | Nature | Buildings |
+|---|---|---|
+| `.` grass | `t` tree | `D` house · `A` apartment · `O` office · `R` restaurant |
+| `,` pavement | `f` flower_patch | `P` park · `S` school · `G` grocery_store · `H` hospital |
+| `-` road_one_way | `b` bush | `F` fire_station · `C` police_station · `E` power_plant |
+| `=` road_two_way | | `M` shopping_mall · `Z` theme_park |
+| `+` road_intersection | | |
+| `x` crosswalk | | |
+| `_` sidewalk | | |
+
+### LLM-facing view: `cityToAscii(city)`
+Returns `{ grid: string; legend: string }`. `grid` overlays nature and properties onto a copy of `tile_grid` (properties stamp their char across their whole footprint so the LLM sees size/shape), joined with newlines. `legend` is the static `ASCII_LEGEND` string listing every code. Caller is responsible for deciding how to ship this to the agent (raw grid at 50×50 is ~2.5k chars and fits easily; at 500×500 it's 250k and needs a viewport or block-level summary instead).
 
 ## CityRenderer construction helpers
 Defined at module level in `CityRenderer.tsx`, used to build `testProps: Property[]`:
