@@ -124,6 +124,11 @@ type Position = {
 	"/assets/home_v2_2_2.png",
   ];
 
+  const APARTMENT_IMAGES = [
+	"/assets/apartment_v1_3_3.png",
+	"/assets/apartment_v2_3_3.png",
+  ];
+
   const PROPERTY_DEFAULTS: Record<PropertyName, Omit<Property, "position" | "current_occupants">> = {
 	park: {
 	  name: "park",
@@ -182,14 +187,14 @@ type Position = {
 	},
 	apartment: {
 	  name: "apartment",
-	  width: 2,
-	  height: 2,
+	  width: 3,
+	  height: 3,
 	  is_enterable: true,
 	  capacity: 10,
 	  boredom_decrease: 2,
 	  hunger_decrease: 5,
 	  tiredness_decrease: 10,
-	  image: "/assets/apartment_2_2.png",
+	  image: APARTMENT_IMAGES[Math.floor(Math.random() * APARTMENT_IMAGES.length)],
 	},
 	restaurant: {
 	  name: "restaurant",
