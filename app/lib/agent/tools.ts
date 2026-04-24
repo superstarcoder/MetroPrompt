@@ -96,7 +96,15 @@ export function applyBatch(
 // TOOL SCHEMAS (Anthropic SDK shape)
 // ============================================================
 
-export const TOOL_SCHEMAS = [
+export const TOOL_SCHEMAS: Array<{
+  name: 'place_property' | 'place_tile_rect' | 'finish';
+  description: string;
+  input_schema: {
+    type: 'object';
+    properties: Record<string, unknown>;
+    required: string[];
+  };
+}> = [
   {
     name: 'place_property',
     description:
@@ -141,4 +149,4 @@ export const TOOL_SCHEMAS = [
       required: ['reason'],
     },
   },
-] as const;
+];

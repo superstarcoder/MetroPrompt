@@ -1,7 +1,7 @@
 # MetroPrompt — Agentic City Builder
 
 ## Project Overview
-A pixel-art agentic city builder for a hackathon. The user prompts a Mayor agent, which orchestrates Zone and Infrastructure agents to build and govern a living city. After 7 simulated days, citizens provide feedback and the Mayor generates a formal report.
+A pixel-art agentic city builder for a hackathon. The user prompts a Mayor agent (Claude Managed Agents) which lays out a 50×50 city via tool calls, streaming the build live to the browser. Future stages: citizens simulate for 7 days, then the Mayor generates a report. Multi-agent split (Mayor → Zone + Infrastructure sub-agents) is a Stage 5 polish item.
 
 ## Hackathon Context
 - **Prompt theme:** "Build For What's Next" — interfaces without a name, workflows from a few years out
@@ -10,9 +10,8 @@ A pixel-art agentic city builder for a hackathon. The user prompts a Mayor agent
 ## Tech Stack
 - **Framework:** Next.js 16 (App Router) — full-stack, API routes for Claude SDK backend. **Breaking changes vs training data** — see `app/AGENTS.md`; consult `node_modules/next/dist/docs/` before writing Next.js code.
 - **Rendering:** Pixi.js v8 (vanilla, dynamically imported inside `useEffect`) — WebGL, nearest-neighbor scaling for crisp pixel art
-- **State:** Zustand — lightweight game-like mutable state
-- **Streaming:** Server-Sent Events (SSE) — streams agent actions to frontend in real time
-- **Agents:** Anthropic SDK multi-agent via tool calls
+- **Agents:** **Claude Managed Agents** (Anthropic's hosted agent loop). Our placement helpers are exposed as **custom tools** — the Mayor fires `agent.custom_tool_use` events, our backend applies them to the `City` and responds with `user.custom_tool_result`. See `app/lib/agent/mayor.ts`.
+- **Streaming:** Two-layer SSE — Anthropic's session event stream → our Next.js route handler (runs the custom-tool loop) → browser EventSource. See `app/app/api/mayor/[sessionId]/stream/route.ts`.
 - **Pixel art:** PixelLab (AI-assisted isometric sprite generation)
 
 ## Project Structure
@@ -22,16 +21,30 @@ MetroPrompt/
   assets/                — all pixel art sprites
   app/                   — Next.js application
     AGENTS.md            — Next.js 16 warning (breaking changes)
+    .env.local           — ANTHROPIC_API_KEY, MAYOR_AGENT_ID, MAYOR_ENV_ID (do not commit)
     app/
-      page.tsx           — server component entry point (no 'use client')
+      page.tsx           — server component entry point
       layout.tsx
       globals.css
+      api/
+        mayor/
+          route.ts                             — POST: create Mayor session
+          [sessionId]/
+            stream/route.ts                    — GET: SSE proxy + custom-tool loop
+            interrupt/route.ts                 — POST: halt session (user.interrupt)
+            message/route.ts                   — POST: send redirect (user.message)
     components/
-      CityRendererWrapper.tsx — client component that owns the ssr:false dynamic import
-      CityRenderer.tsx        — Pixi.js renderer ('use client', tiles + nature + properties + pan/zoom + grid)
+      CityRendererWrapper.tsx — 'use client', owns the ssr:false dynamic import
+      CityRenderer.tsx        — 'use client', Pixi.js renderer + Mayor control UI + SSE consumer
     lib/
-      all_types.tsx      — simulation data schema, source of truth (all exports)
+      all_types.tsx      — simulation data schema, source of truth
       renderConfig.ts    — per-sprite render offsets and scale (visual tuning only)
+      agent/
+        tools.ts         — ToolCall union, TOOL_SCHEMAS, applyToolCall dispatcher
+        observation.ts   — buildObservation (dormant; kept for future prompt-pumped variants)
+        mayor.ts         — MAYOR_MODEL const, ensureMayor, createMayorSession, runMayorLoop, sendInterrupt, sendRedirect
+    scripts/
+      test_step1.ts      — npx tsx smoke test for the tool dispatcher + observation builder
     public/assets/       — sprites served to browser
 ```
 
@@ -42,17 +55,19 @@ MetroPrompt/
 - This three-layer pattern is required: `ssr: false` is not allowed in server components, so the dynamic import must live in a client component wrapper
 
 ## Agent Architecture
-- **Mayor agent** — high-level city goals, population targets, happiness metrics, reacts to simulation feedback
-- **Zone agents** — place `Property` objects (residential, commercial, civic)
-- **Infrastructure agents** — lay ground tiles (roads, sidewalks, crosswalks) via `place_tile(name, x, y)`
-- Agents communicate exclusively via **tool calls** (e.g. `place_property(name, x, y)`, `place_tile(name, x, y)`, `spawn_citizen(home_property_id)`)
+Single **Mayor agent** running on Claude Managed Agents. Zone / Infrastructure sub-agents (multi-agent split) are deferred to Stage 5 polish — see `app/lib/agent/mayor.ts`'s `MAYOR_SYSTEM` prompt for current capabilities.
+
+- **Design insight:** LLMs can't reliably emit clean 50×50 ASCII grids, but they read them well. So ASCII is LLM *input* (via `cityToAscii`), tool calls are LLM *output*. All tool calls are validated at the call site — `placeProperty` / `placeTileRect` throw on overlap + OOB with structured coordinates, which the Mayor reads and retries.
+- **Custom-tool pattern:** our tools (`place_property`, `place_tile_rect`, `finish`) are declared on the agent (no container execution). Mayor emits `agent.custom_tool_use` → our server runs `applyToolCall` → sends `user.custom_tool_result`. See §Mayor Agent below.
+- **Model:** `claude-sonnet-4-6` for dev iteration. Flip `MAYOR_MODEL` in `mayor.ts` to `claude-opus-4-7` for demo day — one-line change.
 
 ## Build Stages
 1. **Data schema** ✅ — `app/lib/all_types.tsx`
 2. **Pixel art + rendering system** ✅ — Pixi.js isometric renderer with pan/zoom, grid overlay toggle
-3. **Mayor + Zone + Infrastructure agents + orchestration** — headless; outputs final `City` state
-4. **Connect backend to frontend** — SSE streaming so the city is built live on screen
-5. **7-day citizen simulation + feedback loop** — needs decay, pathfinding, citizens generate feedback → Mayor report
+3. **Mayor agent via Managed Agents** ✅ — see §Mayor Agent
+4. **Connect backend to frontend** ✅ — SSE live build, Build button + Pause + Redirect UI in `CityRenderer.tsx`
+5. **Polish** — prompt tuning, multi-agent split (Mayor → Zone / Infra), `pdf`/`docx` skill for final report, `web_search` preamble, `code_execution` for sim stats, memory stores for cross-playthrough learning
+6. **7-day citizen simulation + feedback loop** — needs decay, pathfinding, citizens generate feedback → Mayor report
 
 ## Rendering System (Stage 2 — complete)
 
@@ -93,13 +108,13 @@ Because properties anchor at their back corner and the painter's sort uses that 
 - Nature textures keyed by image path — `natureTex['/assets/tree_v3_1_1.png']`, collected from `city.all_nature`
 - All unique paths collected upfront and loaded in parallel via `Assets.load`
 
-### Test scene layout (`CityRenderer.tsx`)
-- `GRID_SIZE = 50` (50×50 demo grid; real `City` schema uses 500×500)
-- 4×4 block layout separated by 2-tile roads + 1-tile sidewalks
-- Road columns: x = 12–13, 26–27, 40–41
-- Road rows: y = 12–13, 26–27, 40–41
-- Sidewalk columns/rows: 11, 14, 25, 28, 39, 42
-- `testProps` hand-places a mix of residential/commercial/civic buildings across the 16 blocks
+### Scene lifecycle (`CityRenderer.tsx`)
+- `GRID_SIZE = 50` (50×50 demo grid; real `City` schema uses 500×500).
+- **Empty on mount** — `cityRef.current = initCity(50)` (all grass, no buildings). The scene fills in live as the Mayor streams tool events.
+- **Textures preloaded upfront** — every possible tile + property variant (`ALL_TILE_IMAGES`, `ALL_PROP_IMAGES` at module top), so `tool_applied` events render immediately without load gaps.
+- **Re-render scheduling** — each `tool_applied` event mutates `cityRef.current` via `placeProperty` / `placeTileRect`, then calls `scheduleRender()` which coalesces to a single `requestAnimationFrame` (so a batch of 10 tool calls per Mayor turn = one repaint, not ten).
+- **Two-layer world container** — `world > spritesLayer + gridLines`. Repaints clear `spritesLayer.removeChildren()` only; `gridLines` survives.
+- **Client-side variant roulette** — when the Mayor emits `place_property(apartment, …)` the browser picks a random image from `APARTMENT_IMAGES` for visual variety. The server's parallel copy uses `PROPERTY_DEFAULTS[name].image`. They diverge only on cosmetic variant — not on structure.
 
 ### Pixi.js v8 notes
 - Must be dynamically imported inside `useEffect`: `const { Application, ... } = await import('pixi.js')`
@@ -156,7 +171,7 @@ Variant image arrays:
 - `OFFICE_IMAGES` — `office_v1_3_3.png`, `office_v2_3_3.png`, `office_v3_3_3.png`
 
 ### Important: no Math.random() at module level
-`PROPERTY_DEFAULTS` uses index `[0]` for variant buildings. Random variant selection happens at construction time (in helpers like `apt()`, `office()`, and the nature-spawn loop inside `init()`), never at module evaluation time — doing so causes React hydration mismatches.
+`PROPERTY_DEFAULTS` uses index `[0]` for variant buildings. Random variant selection happens inside `useEffect` / on tool-event handlers (e.g. `pickPropertyImage` in `CityRenderer.tsx`), never at module evaluation time — doing so causes React hydration mismatches.
 
 ### People (`Person`)
 `name`, `age_group` (`adult`/`child`), `job` (see `Job` union, `null` for children), `home: Property`, `current_location: Position`, `current_path: Position[]`, `inside_property: Property | null`, needs `hunger`/`boredom`/`tiredness` (1–10) with per-person decay rates `hunger_rate` (1.5–4.5), `boredom_rate`/`tiredness_rate` (1.0–4.0), plus `image`.
@@ -180,10 +195,11 @@ City = {
 ```
 
 Helpers (all in `all_types.tsx`):
-- `initCity(size = 500)` — all-grass grid, empty lists. `size` is parameterized so the renderer's test scene can use 50×50.
-- `placeTile(city, x, y, name: TileName)` — sets `tile_grid[y][x] = TILE_CODES[name]`.
-- `placeProperty(city, property)` — pushes to `all_properties`. Does **not** touch `tile_grid`; buildings sit on grass by convention.
-- `placeNature(city, nature)` — pushes to `all_nature`. Does not touch `tile_grid`.
+- `initCity(size = 500)` — all-grass grid, empty lists. `size` is parameterized so the renderer uses 50×50.
+- `placeTile(city, x, y, name: TileName)` — sets `tile_grid[y][x] = TILE_CODES[name]`. No validation (fast).
+- `placeTileRect(city, x1, y1, x2, y2, name: TileName)` — fills a rectangle (corners inclusive, normalized). **Throws** on OOB with grid dims in the message. This is the Mayor's primary ground-paint brush.
+- `placeProperty(city, property)` — **throws** on OOB or footprint overlap with an existing property, with both building names + coordinates in the error. Pushes to `all_properties` on success. Does **not** touch `tile_grid`; buildings sit on grass by convention.
+- `placeNature(city, nature)` — pushes to `all_nature`. No validation.
 - `getTileAt(city, position): TileName` — decodes via `CODE_TO_TILE`.
 - `getPropertyAt(city, position): Property | undefined` — O(n) scan over `all_properties` for a footprint covering `position`.
 
@@ -200,15 +216,44 @@ Helpers (all in `all_types.tsx`):
 | `x` crosswalk | | |
 | `_` sidewalk | | |
 
-### LLM-facing view: `cityToAscii(city)`
-Returns `{ grid: string; legend: string }`. `grid` overlays nature and properties onto a copy of `tile_grid` (properties stamp their char across their whole footprint so the LLM sees size/shape), joined with newlines. `legend` is the static `ASCII_LEGEND` string listing every code. Caller is responsible for deciding how to ship this to the agent (raw grid at 50×50 is ~2.5k chars and fits easily; at 500×500 it's 250k and needs a viewport or block-level summary instead).
+### LLM-facing view: `cityToAscii(city)` and `asciiToCity(ascii, opts?)`
+- **`cityToAscii(city) → { grid, legend }`** — `grid` overlays nature and properties onto a copy of `tile_grid` (properties stamp their char across their whole footprint so the LLM sees size/shape), joined with newlines. `legend` is the static `ASCII_LEGEND` string. At 50×50 the grid is ~2.5k chars (fits easily); at 500×500 it's 250k and needs a viewport or block-level summary.
+- **`asciiToCity(ascii, opts?) → City`** — inverse parser, used as a dev/test utility (not wired into the agent pipeline). Strict: throws with `(x, y)` on ragged rows, malformed multi-cell property footprints, overlaps, or unknown chars. `opts.variantStrategy` is `'default'` (deterministic, SSR-safe) or `'random'` (client-only) for picking variant images.
 
-## CityRenderer construction helpers
-Defined at module level in `CityRenderer.tsx`, used to build `testProps: Property[]`:
-- `bldg(name, x, y)` — any non-variant property (or variant using its default image)
-- `apt(v, x, y)` — apartment with explicit variant (1 or 2)
-- `house(x, y)` — house using `HOUSE_IMAGES[1]` (`home_v2`, 2×2)
-- `office(v, x, y)` — office with explicit variant (1, 2, or 3)
+## Mayor Agent (`app/lib/agent/`)
+
+### File layout
+- **`tools.ts`** — `ToolCall` discriminated union (`place_property` | `place_tile_rect` | `finish`), per-tool input shapes matching our schema, `applyToolCall(city, call) → ToolResult` dispatcher that wraps the throwing placement helpers into `{ ok: true }` / `{ ok: false, error }`, and `TOOL_SCHEMAS` — the JSON Schema list passed directly to `agents.create({ tools })`.
+- **`mayor.ts`** — Managed Agents plumbing:
+  - `MAYOR_MODEL` constant (top of file) — flip to `claude-opus-4-7` for demo day.
+  - `ensureMayor()` — create-or-reuse pattern for the agent + environment. Reads `MAYOR_AGENT_ID` / `MAYOR_ENV_ID` from env; if missing, creates them and logs the IDs to add to `.env.local`. Avoids the #1 MA anti-pattern (new agent per request).
+  - `createMayorSession(goal)` — `sessions.create()` with agent + env, stashes `{ city: initCity(50), pendingGoal, interrupted: false }` in a module-level `sessions` Map.
+  - `runMayorLoop(sessionId, onEvent)` — stream-first ordering: opens `events.stream()`, then sends the pending goal. For each `agent.custom_tool_use` event: parse → apply via `applyToolCall` → `events.send({user.custom_tool_result, is_error})` back. Emits `tool_applied` synthetic events for the frontend. Terminates on `session.status_terminated`, on `stop_reason: retries_exhausted`, or on `end_turn` when `!state.interrupted`. Turn cap = `MAX_CUSTOM_TOOL_USES = 70`; at the cap we send `user.interrupt` + a nudge asking the Mayor to call `finish`.
+  - `sendInterrupt(sessionId)` — sets `state.interrupted = true`, fires `user.interrupt`. The loop sees the resulting `end_turn` idle and stays alive.
+  - `sendRedirect(sessionId, text)` — clears `state.interrupted`, fires `user.message`. The loop's pending `stream.next()` unblocks with a `session.status_running` event and the Mayor resumes.
+- **`observation.ts`** — `buildObservation(city, errors)` composes `cityToAscii` + counts + prior-turn errors into a text block. Dormant: MA surfaces state via events, not prompt-pumped observations. Kept for a future prompt variant or the Zone/Infra sub-agents.
+
+### API routes (`app/app/api/mayor/`)
+- **`POST /api/mayor`** — body `{ goal: string }` → `{ sessionId }`. Validates the body, calls `createMayorSession(goal)`.
+- **`GET /api/mayor/[sessionId]/stream`** — SSE. Opens a `ReadableStream`, runs `runMayorLoop` server-side, forwards each `MayorStreamEvent` as `event: mayor\ndata: <json>\n\n`. Browser narrows by `payload.kind`: `anthropic_event` | `tool_applied` | `done`.
+- **`POST /api/mayor/[sessionId]/interrupt`** — wraps `sendInterrupt`. Returns `{ ok: true }`.
+- **`POST /api/mayor/[sessionId]/message`** — body `{ text: string }`. Wraps `sendRedirect`.
+
+All four routes return `{ error: "..." }` with 404/400/500 on unknown sessionId / missing fields / server error.
+
+### Frontend integration (`components/CityRenderer.tsx`)
+- Mayor control panel (top-left): goal textarea, Build button, status chip (`idle` / `running` / `paused` / `done`), Pause button (while running), Redirect textarea + "Resume with nudge" button (while paused), Mayor's-thoughts scroll panel showing the last 5 `agent.message` texts.
+- Build flow: clears local `cityRef`, POSTs `/api/mayor`, opens `new EventSource(.../stream)`, listens for `event: mayor`, and on each `tool_applied` with `result.ok === true` calls `placeProperty` / `placeTileRect` against the local city, then `scheduleRender()`.
+- Status state machine drives UI from `session.status_*` events (see `handleMayorEvent`).
+
+### Environment variables (`app/.env.local`)
+- `ANTHROPIC_API_KEY` — required.
+- `MAYOR_AGENT_ID`, `MAYOR_ENV_ID` — persist after first boot so subsequent dev-server restarts reuse the same agent/environment instead of creating fresh ones. If missing, `ensureMayor()` creates them and logs the IDs to paste in.
+
+### Known limitations (deferred to Stage 5 polish)
+- **Reconnect mid-stream not supported.** The server-side `runMayorLoop` guards against double-attach with a `running` flag. If the browser disconnects mid-build, the server loop continues to completion but a new page can't re-attach (`"loop already running"`). Fix: MA client Pattern 1 — `events.list()` + dedupe on reconnect. Out of scope for hackathon.
+- **Single-user demo assumption.** Module-level `sessions` Map is per-process. Two browser tabs can coexist with different sessions but not multi-tenant.
+- **No persistence across server restarts.** City state lives in memory; dev-server restart wipes active sessions (but the MA session itself persists on Anthropic's side — could reconnect with Pattern 1 once implemented).
 
 ## Key Design Notes
 - Citizens have needs that decay over time; buildings satisfy those needs — the city either *works* or *fails*, not just gets built
