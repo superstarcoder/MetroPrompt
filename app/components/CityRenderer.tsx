@@ -89,7 +89,7 @@ const office = (v: 1 | 2 | 3, x: number, y: number): Property => ({
 //          row0=y[0..10], row1=y[15..24], row2=y[29..38], row3=y[43..49]
 const testProps: Property[] = [
   // B(0,0) — Residential + Park
-  bldg('power_plant', 0, 0),
+  bldg('shopping_mall', 0, 0),
   // office(3,           0,  0),
   // office(1,           4,  0),
   // office(3,           8,  0),

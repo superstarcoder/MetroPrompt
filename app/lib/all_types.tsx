@@ -104,7 +104,9 @@ export type PropertyName =
   | "restaurant"
   | "fire_station"
   | "police_station"
-  | "power_plant";
+  | "power_plant"
+  | "shopping_mall"
+  | "theme_park";
 
 export type Property = {
   name: PropertyName;
@@ -284,6 +286,28 @@ export const PROPERTY_DEFAULTS: Record<PropertyName, Omit<Property, "position" |
     hunger_decrease: 0,
     tiredness_decrease: 0,
     image: "/assets/powerplant_3_3.png",
+  },
+  shopping_mall: {
+    name: "shopping_mall",
+    width: 3,
+    height: 3,
+    is_enterable: true,
+    capacity: 40,
+    boredom_decrease: 6,
+    hunger_decrease: 6,
+    tiredness_decrease: 0,
+    image: "/assets/shopping_mall_3_3.png",
+  },
+  theme_park: {
+    name: "theme_park",
+    width: 3,
+    height: 3,
+    is_enterable: true,
+    capacity: 60,
+    boredom_decrease: 10,
+    hunger_decrease: 2,
+    tiredness_decrease: 0,
+    image: "/assets/theme_park_3_3.png",
   },
 };
 

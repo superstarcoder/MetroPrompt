@@ -8,7 +8,7 @@ A pixel-art agentic city builder for a hackathon. The user prompts a Mayor agent
 - **Timeline:** 4 days of hacking (started ~2026-04-22)
 
 ## Tech Stack
-- **Framework:** Next.js 16 (App Router) — full-stack, API routes for Claude SDK backend
+- **Framework:** Next.js 16 (App Router) — full-stack, API routes for Claude SDK backend. **Breaking changes vs training data** — see `app/AGENTS.md`; consult `node_modules/next/dist/docs/` before writing Next.js code.
 - **Rendering:** Pixi.js v8 (vanilla, dynamically imported inside `useEffect`) — WebGL, nearest-neighbor scaling for crisp pixel art
 - **State:** Zustand — lightweight game-like mutable state
 - **Streaming:** Server-Sent Events (SSE) — streams agent actions to frontend in real time
@@ -21,13 +21,14 @@ MetroPrompt/
   OLD_all_types.tsx      — archived original schema (do not use)
   assets/                — all pixel art sprites
   app/                   — Next.js application
+    AGENTS.md            — Next.js 16 warning (breaking changes)
     app/
       page.tsx           — server component entry point (no 'use client')
       layout.tsx
       globals.css
     components/
       CityRendererWrapper.tsx — client component that owns the ssr:false dynamic import
-      CityRenderer.tsx        — Pixi.js renderer ('use client', tiles+properties+pan/zoom+grid)
+      CityRenderer.tsx        — Pixi.js renderer ('use client', tiles + nature + properties + pan/zoom + grid)
     lib/
       all_types.tsx      — simulation data schema, source of truth (all exports)
       renderConfig.ts    — per-sprite render offsets and scale (visual tuning only)
@@ -63,37 +64,44 @@ gridToScreen(gx, gy) = {
 }
 ```
 
-### Unified depth-sorted render pass (painter's algorithm)
-Tiles and properties are merged into a single list and sorted by isometric depth before rendering. This ensures decorative tiles (trees, flowers) correctly appear in front of buildings when their grid position warrants it.
+### Two-pass render (current approach)
+1. **Pass 1 — tiles.** Every grid cell's tile texture is drawn as the ground layer. Tiles under property footprints are NOT skipped — they simply get covered by the building in pass 2.
+2. **Pass 2 — nature + properties**, iterated in nested `(gy, gx)` order. For each cell: draw nature if one is keyed there, then draw a property if its anchor (top corner) is at that cell.
 
-- **Tile depth:** `gx + gy`
-- **Property depth:** `px + py` (back/top corner) — using the back corner guarantees all tiles with higher `gx+gy` are drawn after the property
-- **Tiles under property footprints are skipped** — before building the render list, an `occupiedCells` set is built from all property footprints. Tiles in occupied cells are not added to the render list, eliminating depth-sorting conflicts between ground tiles and buildings.
-- Do NOT go back to separate tile/property rendering passes — it breaks isometric occlusion.
+The nested `(gy, gx)` iteration doubles as a painter's-algorithm sort: larger `gy+gx` ⇒ lower on screen ⇒ drawn later ⇒ on top. Since properties anchor at their back corner and nature is only spawned on unoccupied grass cells, occlusion works for the current test layouts without an explicit depth sort.
+
+If future layouts get denser (taller buildings, overlapping footprints, nature between buildings), revisit this — a true unified depth-sorted pass may be needed.
 
 ### Tile rendering
 - `anchor.set(0.5, 0)` — top vertex of diamond pinned to grid position
 - Scale: `(TILE_W / texture.width) * cfg.scale`
 - Offsets per tile type stored in `lib/renderConfig.ts` (`TILE_RENDER`)
-- Variant tiles (tree, flower_patch) carry a specific `image` field on the `Cell` object; the render key is derived via `renderKey(cell.image)` rather than `cell.name`
+- Texture lookup in `CityRenderer.tsx` uses a hardcoded `TILE_TEXTURES` map keyed by **the test scene's simplified tile names** (`grass`, `road`, `sidewalk`, `pavement`, `crosswalk`, `intersection`) — these do not match the full `TileName` union in `all_types.tsx` (`road_one_way`, `road_two_way`, `road_intersection`, etc.). Reconcile when connecting real agent output.
+
+### Nature rendering
+- `Nature` items (`tree`, `flower_patch`, `bush`) are randomly spawned inside `init()` on grass cells that aren't occupied by a property (~4% tree, ~4% flower_patch, ~2% bush).
+- Rendered like tiles: `anchor.set(0.5, 0)`, same scale formula, offsets pulled from `TILE_RENDER` (same record as tiles) keyed by `renderKey(nat.image)` — e.g. `tree_v3`, `flower_patch_v1`, `bush_v1`.
 
 ### Property rendering
 - `anchor.set(0.5, 0)` — top vertex of footprint diamond pinned to grid position
-- Width: `prop.width * TILE_W * cfg.scale`
+- Width: `prop.width * TILE_W * cfg.scale`; y scale matches x (`sprite.scale.y = sprite.scale.x`)
 - Y adjusted by `-(prop.width - 1) * TILE_H` to correct for building height above footprint
 - Render key derived from image path via `renderKey(prop.image)` — strips path and size suffix: `/assets/apartment_v1_3_3.png` → `apartment_v1`
 - **Placement convention:** `(gx, gy)` = top corner of diamond footprint. A 3×3 property at (0,0) occupies cells (0,0)–(2,2).
 
 ### Texture loading
-- Tile textures keyed by image path (not tile name) — `tileTex['/assets/grass_1_1.png']`
+- Tile textures keyed by image path — `tileTex['/assets/grass_1_1.png']`
 - Property textures keyed by image path — `propTex['/assets/apartment_v1_3_3.png']`
-- All unique paths collected upfront and loaded in parallel
+- Nature textures keyed by image path — `natureTex['/assets/tree_v3_1_1.png']`
+- All unique paths collected upfront and loaded in parallel via `Assets.load`
 
-### Road layout (test grid)
-- Roads are **2 tiles wide** — two parallel 1×1 road tiles per road
+### Test scene layout (`CityRenderer.tsx`)
+- `GRID_SIZE = 50` (50×50 demo grid; real `City` schema uses 500×500)
+- 4×4 block layout separated by 2-tile roads + 1-tile sidewalks
 - Road columns: x = 12–13, 26–27, 40–41
 - Road rows: y = 12–13, 26–27, 40–41
-- Sidewalks flank each road on both sides (1 tile wide)
+- Sidewalk columns/rows: 11, 14, 25, 28, 39, 42
+- `testProps` hand-places a mix of residential/commercial/civic buildings across the 16 blocks
 
 ### Pixi.js v8 notes
 - Must be dynamically imported inside `useEffect`: `const { Application, ... } = await import('pixi.js')`
@@ -102,65 +110,82 @@ Tiles and properties are merged into a single list and sorted by isometric depth
 - `app.canvas` (not `app.view`) for the canvas element
 
 ### renderConfig.ts
-Separates visual tuning from game logic. Contains per-sprite `{ offsetX, offsetY, scale }` for all tile and property types. Edit this file to adjust sprite alignment without touching the schema or renderer logic.
+Separates visual tuning from game logic. Contains per-sprite `{ offsetX, offsetY, scale }` for all tile, nature, and property render keys. Edit this file to adjust sprite alignment without touching the schema or renderer logic.
 
 Keys use the sprite variant name (same as what `renderKey()` derives from the image path):
-- `apartment_v1`, `apartment_v2`
-- `office_v1`, `office_v2`, `office_v3`
-- `home_v1`, `home_v2` (note: `home_`, not `house_` — matches image filenames)
-- `tree_v1`, `tree_v2`, `tree_v3`, `tree_v4`
-- `flower_patch_v1`
+- Tile keys: `grass`, `road`, `road_one_way`, `road_two_way`, `intersection`, `crosswalk`, `sidewalk`, `pavement`
+- Nature keys: `tree_v1`–`tree_v4`, `flower_patch_v1`, `bush_v1`
+- Property keys: `park`, `hospital`, `school`, `grocery_store`, `fire_station`, `police_station`, `powerplant`, `restaurant`, `shopping_mall`, `theme_park`, `apartment_v1`, `apartment_v2`, `office_v1`–`office_v3`, `home_v1`, `home_v2` (note: `home_`, not `house_` — matches image filenames; the `powerplant` key also differs from the `power_plant` property name)
 
 ## Data Schema (`app/lib/all_types.tsx`)
 All types and constants are exported. Import via `@/lib/all_types`.
 
 ### Tiles (`TileName`)
-`pavement`, `road_one_way`, `road_two_way`, `road_intersection`, `crosswalk`, `sidewalk`, `grass`, `flower_patch`, `bush`, `tree`
+`pavement`, `road_one_way`, `road_two_way`, `road_intersection`, `crosswalk`, `sidewalk`, `grass`
 
-- `flower_patch` — walkable, 1 variant: `flower_patch_v1_1_1.png`
-- `tree` — not walkable, 4 variants: `tree_v1_1_1.png` – `tree_v4_1_1.png` (exported as `TREE_IMAGES`)
-- `bush` — not walkable, no sprite asset yet
+`Tile = { name, can_walk_through, can_drive_through, position, width, height, image }`. `TILE_DEFAULTS` provides `Omit<Tile, "position">` for each name.
 
-### Properties (`PropertyName`) and sizes
-| Property | Size | Notes |
-|---|---|---|
-| `park` | 3×3 | boredom↓8, tiredness↓3 |
-| `hospital` | 3×3 | tiredness↓5 |
-| `school` | 3×3 | boredom↓3 |
-| `grocery_store` | 3×3 | hunger↓8 |
-| `fire_station` | 3×3 | no need stats (risk mitigation) |
-| `police_station` | 3×3 | no need stats (risk mitigation) |
-| `power_plant` | 3×3 | no need stats |
-| `apartment` | 3×3 | cap 10, 2 variants (`APARTMENT_IMAGES`) |
-| `office` | 3×3 | cap 30, boredom↓3, 3 variants (`OFFICE_IMAGES`) |
-| `restaurant` | 2×2 | hunger↓10, boredom↓5 |
-| `house` | 2×2 | cap 4, 2 variants (`HOUSE_IMAGES`) |
+### Nature (`NatureName`) — separate from tiles
+`tree`, `flower_patch`, `bush`. `Nature = { name, position, image }` — no walkability flags (enforced by rendering / pathfinding).
 
-### Variant image arrays
+Variant image arrays:
+- `TREE_IMAGES` — `tree_v1_1_1.png` – `tree_v4_1_1.png`
+- `FLOWER_PATCH_IMAGES` — `flower_patch_v1_1_1.png`
+- `BUSH_IMAGES` — `bush_v1_1_1.png`
+
+### Properties (`PropertyName`) and stats
+`Property = { name, position, width, height, is_enterable, current_occupants, capacity, boredom_decrease, hunger_decrease, tiredness_decrease, image }`.
+
+| Property | Size | Cap | Enterable | Boredom↓ | Hunger↓ | Tiredness↓ |
+|---|---|---|---|---|---|---|
+| `park` | 3×3 | 50 | ✅ | 8 | 0 | 3 |
+| `hospital` | 3×3 | 20 | ✅ | 0 | 0 | 5 |
+| `school` | 3×3 | 80 | ✅ | 3 | 0 | 0 |
+| `grocery_store` | 3×3 | 30 | ✅ | 2 | 8 | 0 |
+| `house` | 2×2 | 4 | ✅ | 2 | 5 | 10 |
+| `apartment` | 3×3 | 10 | ✅ | 2 | 5 | 10 |
+| `office` | 3×3 | 30 | ✅ | 3 | 0 | 0 |
+| `restaurant` | 2×2 | 30 | ✅ | 5 | 10 | 0 |
+| `fire_station` | 3×3 | 10 | ❌ | 0 | 0 | 0 |
+| `police_station` | 3×3 | 10 | ❌ | 0 | 0 | 0 |
+| `power_plant` | 3×3 | 5 | ❌ | 0 | 0 | 0 |
+| `shopping_mall` | 3×3 | 40 | ✅ | 6 | 6 | 0 |
+| `theme_park` | 3×3 | 60 | ✅ | 10 | 2 | 0 |
+
+Variant image arrays:
 - `HOUSE_IMAGES` — `home_v1_1_1.png`, `home_v2_2_2.png`
 - `APARTMENT_IMAGES` — `apartment_v1_3_3.png`, `apartment_v2_3_3.png`
 - `OFFICE_IMAGES` — `office_v1_3_3.png`, `office_v2_3_3.png`, `office_v3_3_3.png`
-- `TREE_IMAGES` — `tree_v1_1_1.png` – `tree_v4_1_1.png`
 
 ### Important: no Math.random() at module level
-`PROPERTY_DEFAULTS` and `TILE_DEFAULTS` use index `[0]` for variant properties. Random variant selection happens at construction time (in helpers like `apt()`, `office()`, `randomTreeImage()`), never at module evaluation time — doing so causes React hydration mismatches.
+`PROPERTY_DEFAULTS` and `TILE_DEFAULTS` use index `[0]` for variant properties. Random variant selection happens at construction time (in helpers like `apt()`, `office()`, and the nature-spawn loop inside `init()`), never at module evaluation time — doing so causes React hydration mismatches.
 
-### People
-`name`, `age_group` (adult/child), `job`, `home`, `current_location`, `current_path`, `inside_property`, needs (`hunger`/`boredom`/`tiredness`) with individual decay rates
+### People (`Person`)
+`name`, `age_group` (`adult`/`child`), `job` (see `Job` union, `null` for children), `home: Property`, `current_location: Position`, `current_path: Position[]`, `inside_property: Property | null`, needs `hunger`/`boredom`/`tiredness` (1–10) with per-person decay rates `hunger_rate` (1.5–4.5), `boredom_rate`/`tiredness_rate` (1.0–4.0), plus `image`.
 
-### City
-`city_grid: GridCell[][]`, `all_citizens`, `all_properties`, `day` (1–7)
+Helpers:
+- `JOB_OPTIONS` — all non-null jobs (`teacher`, `doctor`, `firefighter`, `police_officer`, `chef`, `grocer`, `engineer`, `unemployed`)
+- `randomBetween(min, max)`
+- `spawnPerson(age_group, home, availableImages)` — assigns random job (null for children), randomized needs/rates, picks image from supplied list. Depends on an external `generateRandomName()` (declared, not yet implemented).
+
+### Grid and City
+- `GridCell = { kind: "tile"; data: Tile } | { kind: "property"; data: Property } | null` — discriminated union
+- `City = { city_grid: GridCell[][], all_citizens: Person[], all_properties: Property[], day: number /* 1–7 */ }`
+- `initCity()` — returns a 500×500 all-grass city
+- `placeTile(city, tile)` — writes to `city_grid[y][x]`
+- `placeProperty(city, property)` — writes the property across its footprint and pushes to `all_properties`
+- `getCellAt(city, position)` — reads `city_grid[y][x]`
 
 ## CityRenderer construction helpers
 Defined at module level in `CityRenderer.tsx`, used to build `testProps: Property[]`:
-- `bldg(name, x, y)` — any non-variant property
+- `bldg(name, x, y)` — any non-variant property (or variant using its default image)
 - `apt(v, x, y)` — apartment with explicit variant (1 or 2)
-- `house(x, y)` — house_v2 (2×2)
+- `house(x, y)` — house using `HOUSE_IMAGES[1]` (`home_v2`, 2×2)
 - `office(v, x, y)` — office with explicit variant (1, 2, or 3)
 
 ## Key Design Notes
 - Citizens have needs that decay over time; buildings satisfy those needs — the city either *works* or *fails*, not just gets built
-- `fire_station` / `police_station` are risk-mitigation infrastructure (no need-decrease stats), not need-satisfiers
+- `fire_station` / `police_station` / `power_plant` are not enterable and have no need-decrease stats (risk/utility infrastructure)
 - `current_path: Position[]` supports pathfinding — citizens visibly walk to buildings
 - `day: 1–7` implies a weekly simulation cycle
 - Pathfinding (A* or similar) on the 500×500 grid is a non-trivial Stage 5 concern — plan for it early
