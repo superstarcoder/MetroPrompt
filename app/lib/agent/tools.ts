@@ -96,12 +96,13 @@ export function applyBatch(
 // TOOL SCHEMAS (Anthropic SDK shape)
 // ============================================================
 
-export const TOOL_SCHEMAS: Array<{
+type ToolSchema = {
   name:
     | 'place_property'
     | 'place_properties'
     | 'place_tile_rect'
     | 'place_tile_rects'
+    | 'delegate_zones'
     | 'finish';
   description: string;
   input_schema: {
@@ -109,7 +110,9 @@ export const TOOL_SCHEMAS: Array<{
     properties: Record<string, unknown>;
     required: string[];
   };
-}> = [
+};
+
+export const TOOL_SCHEMAS: ToolSchema[] = [
   {
     name: 'place_property',
     description:
@@ -199,6 +202,47 @@ export const TOOL_SCHEMAS: Array<{
     },
   },
   {
+    name: 'delegate_zones',
+    description:
+      'Hand off multiple regions of the grid to Zone sub-agents that each fill in one bbox. ' +
+      'Use this for WHOLE-CITY builds after you have laid the road + sidewalk grid: partition the grid into 4-8 non-overlapping zones ' +
+      'along the road grid, and call delegate_zones once with the full list. Each zone runs in parallel with its own tool budget, ' +
+      'sees the current map, and places buildings only inside its bbox. Give each zone a distinct character via the instructions ' +
+      '("dense residential + a small park", "civic center with hospital and school", etc.). ' +
+      'Validation: bboxes must fit in-grid (0-49 on each axis), must not intersect each other, and must not intersect zones from prior delegate_zones calls in this session. ' +
+      'For small edits or partial builds, skip this tool and place directly with place_property / place_properties.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        zones: {
+          type: 'array',
+          minItems: 1,
+          items: {
+            type: 'object',
+            properties: {
+              bbox: {
+                type: 'object',
+                properties: {
+                  x1: { type: 'integer', minimum: 0 },
+                  y1: { type: 'integer', minimum: 0 },
+                  x2: { type: 'integer', minimum: 0 },
+                  y2: { type: 'integer', minimum: 0 },
+                },
+                required: ['x1', 'y1', 'x2', 'y2'],
+              },
+              instructions: {
+                type: 'string',
+                minLength: 1,
+              },
+            },
+            required: ['bbox', 'instructions'],
+          },
+        },
+      },
+      required: ['zones'],
+    },
+  },
+  {
     name: 'finish',
     description: 'Signal the city is complete. Include a one-sentence rationale.',
     input_schema: {
@@ -208,3 +252,9 @@ export const TOOL_SCHEMAS: Array<{
     },
   },
 ];
+
+// Zone agents get placement tools + finish only. Delegate_zones is Mayor-only
+// (no recursive sub-delegation — keeps the system bounded).
+export const ZONE_TOOL_SCHEMAS: ToolSchema[] = TOOL_SCHEMAS.filter(
+  s => s.name !== 'delegate_zones',
+);

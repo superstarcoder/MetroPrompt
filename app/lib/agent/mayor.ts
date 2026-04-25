@@ -2,6 +2,8 @@ import Anthropic from '@anthropic-ai/sdk';
 import type { BetaManagedAgentsStreamSessionEvents } from '@anthropic-ai/sdk/resources/beta/sessions/events';
 import { applyToolCall, TOOL_SCHEMAS } from './tools';
 import type { ToolCall, ToolResult } from './tools';
+import { runZoneBuild } from './zone';
+import type { Bbox, ZoneEvent } from './zone';
 import { initCity } from '../all_types';
 import type { City, PropertyName, TileName } from '../all_types';
 
@@ -38,19 +40,27 @@ RULES (enforced — violations return structured errors with coordinates)
 The user may either want you to build out the whole city or may ask you to make improvements or build only a part of it. Based on the goal, decide on the right strategy and adapt as you go. The city evolves with each tool call, so always consider the current state when placing new elements.
 
 STRATEGY (if asked to build the whole city)
-1. Sketch block layout mentally before placing anything.
-2. Lay the road grid with place_tile_rect (use 'road_two_way'). Roads are typically 2 tiles wide — a horizontal road across the whole grid is ONE call: place_tile_rect("road_two_way", 0, 12, 49, 13).
-3. Lay 1-tile sidewalks on both sides of each road.
-4. Place buildings inside the resulting blocks.
-5. Batch tool calls per turn — emit several in a single response, don't wait for results.
-6. Aim for AT LEAST 15-25 buildings total (unless otherwise specified) plus the road/sidewalk network (unless otherwise specified).
-7. Don't leave too much empty space — the city should feel dense and functional, not sparse and underdeveloped.
-8. Call finish(reason) when you're satisfied with the city.
+You are the coordinator. You lay the infrastructure (roads + sidewalks) and partition the grid, then delegate each region to a Zone sub-agent that fills it in with specialized attention. You do NOT fill in buildings across the whole grid yourself — that's what delegate_zones is for.
+
+1. Sketch the road grid + zoning plan mentally first. Decide: road positions, how to partition the grid into 4–8 non-overlapping zones along those roads, and the character of each zone (residential / commercial / civic / infrastructure / mixed).
+2. Lay the ENTIRE road grid in ONE place_tile_rects call. Roads are typically 2 tiles wide — a full-width horizontal road is one item: { tile: "road_two_way", x1: 0, y1: 12, x2: 49, y2: 13 }. Include all road bands (horizontal and vertical) in this one call.
+3. Lay 1-tile sidewalks on both sides of each road, plus optional crosswalks at intersections, in ONE more place_tile_rects call.
+4. Call delegate_zones ONCE with the full list of zones. For each zone write SPECIFIC, CREATIVE instructions — not just "residential" but "dense walkable residential: apartments along the main road, houses in the interior, one small park at the north edge, a grocery store on the corner." The richer and more imaginative your instructions, the richer the zone's output. Zone sub-agents are specialists; they thrive on concrete direction.
+   IMPORTANT: Zones do NOT see the rest of the city — they only see their bbox + your instructions. So INCLUDE SPATIAL CONTEXT in every zone's instructions: which edges of the bbox border roads (e.g. "main road on east edge at x=11-12, sidewalk on south at y=11"), and what the neighboring zones will contain ("commercial strip directly south, residential to the east"). Without this, zones can't orient their buildings toward roads or create natural gradients with neighbors.
+5. Be sure to include infrastructure (for example: the center zone can be mostly civic with a hospital and school, but also has the power plant and fire station tucked in the southeast corner or spread throughout the zones so that there is more variety and less clumping). A zone with a mix of building types is more interesting to look at and explore.
+6. Don't make the zones too big — 10×10 or 15×15 is a good size. Smaller zones with tight instructions yield denser, more coherent results.
+6. Call finish(reason) when the city feels complete.
+
+Notes:
+- Don't leave large empty regions. Don't keep it extremely packed either. Ensure that the zone agent understands that every property must have at least one tile of grass next to it. 
+- Zone bboxes must not overlap each other OR any previously-delegated zone in this session. The server rejects overlapping bboxes with a clear error listing the offending pair; just normalize and retry.
+- You retain all your own tools (place_property, place_properties, place_tile_rect, place_tile_rects). Use them for cross-zone landmarks or post-delegation touch-ups, not for filling in zones directly.
+- Adapt these guidelines as needed based on the user's prompt!
 
 STRATEGY (if asked to build a specific building or amenity or small cluster or neighborhood or to make improvements)
 1. Sketch mentally before placing anything.
 2. Understand what has been done and what can be built around it — the city evolves, so adapt to the current state.
-3. 
+3. Feel free to use your singleton tools (place_property, place_tile_rect) or their batch variants for smaller, more targeted improvements
 
 Be efficient. The city speaks for itself — no long explanations needed.`;
 
@@ -126,6 +136,9 @@ type SessionState = {
   // message. Used by the end_turn gate in runMayorLoop so the loop stays alive
   // across a pause, waiting for the redirect that resumes it.
   interrupted: boolean;
+  // Bboxes of all zones the Mayor has previously delegated in THIS session.
+  // Used to reject overlapping delegations on subsequent delegate_zones calls.
+  completedZoneBboxes: Bbox[];
 };
 const sessions = new Map<string, SessionState>();
 
@@ -145,6 +158,7 @@ export async function createMayorSession(goal: string): Promise<string> {
     pendingGoal: goal,
     running: false,
     interrupted: false,
+    completedZoneBboxes: [],
   });
   return session.id;
 }
@@ -183,13 +197,18 @@ export type MayorStreamEvent =
   | { kind: 'anthropic_event'; event: BetaManagedAgentsStreamSessionEvents }
   // Our synthetic event after applying a custom tool — useful for the browser to render
   // the ToolResult without reparsing the raw agent.custom_tool_use.
+  // `source` is 'mayor' (default, omitted) for Mayor-originated tool calls, or 'zone'
+  // when forwarded from a Zone agent's loop via delegate_zones.
   | {
       kind: 'tool_applied';
       tool_use_id: string;
       name: string;
       input: Record<string, unknown>;
       result: ToolResult;
+      source?: 'mayor' | 'zone';
     }
+  // Zone agent text (agent.message) forwarded through the Mayor's channel.
+  | { kind: 'zone_message'; text: string }
   // Loop terminated.
   | { kind: 'done'; reason: string };
 
@@ -206,12 +225,34 @@ function parseToolCall(
 
 type PlacePropertyItem = { property: PropertyName; x: number; y: number };
 type PlaceTileRectItem = { tile: TileName; x1: number; y1: number; x2: number; y2: number };
+type DelegateZonesItem = { bbox: Bbox; instructions: string };
 
 function formatProperty(item: PlacePropertyItem): string {
   return `place_property(${item.property}, ${item.x}, ${item.y})`;
 }
 function formatTileRect(item: PlaceTileRectItem): string {
   return `place_tile_rect(${item.tile}, ${item.x1},${item.y1}–${item.x2},${item.y2})`;
+}
+function formatBbox(b: Bbox): string {
+  return `(${b.x1},${b.y1})–(${b.x2},${b.y2})`;
+}
+
+// Normalize bboxes so x1<=x2 and y1<=y2 (tolerate the LLM swapping corners).
+function normalizeBbox(raw: { x1: number; y1: number; x2: number; y2: number }): Bbox {
+  return {
+    x1: Math.min(raw.x1, raw.x2),
+    y1: Math.min(raw.y1, raw.y2),
+    x2: Math.max(raw.x1, raw.x2),
+    y2: Math.max(raw.y1, raw.y2),
+  };
+}
+
+function bboxInGrid(b: Bbox): boolean {
+  return b.x1 >= 0 && b.y1 >= 0 && b.x2 <= 49 && b.y2 <= 49;
+}
+
+function bboxesIntersect(a: Bbox, b: Bbox): boolean {
+  return a.x1 <= b.x2 && a.x2 >= b.x1 && a.y1 <= b.y2 && a.y2 >= b.y1;
 }
 
 export async function runMayorLoop(
@@ -342,6 +383,110 @@ export async function runMayorLoop(
               ? `ok: all ${items.length} placed`
               : `partial: ${okCount}/${items.length} placed\nfailed:\n${failures.join('\n')}`;
           await sendResult(text, failures.length > 0);
+          await sendCapNudgeIfHit();
+          continue;
+        }
+
+        // ---- DELEGATE_ZONES: fan out to parallel Zone agents ----
+        if (event.name === 'delegate_zones') {
+          const rawZones =
+            (event.input as { zones?: DelegateZonesItem[] }).zones ?? [];
+          // Normalize every bbox upfront so downstream checks + Zone loops see
+          // consistent corners (tolerates LLM swapping x1/x2 etc.).
+          const zones: DelegateZonesItem[] = rawZones.map(z => ({
+            bbox: normalizeBbox(z.bbox),
+            instructions: z.instructions,
+          }));
+
+          // Validate bboxes before spawning anything. All-or-nothing validation —
+          // partial spawning is more confusing than a single clear error.
+          const validationErrors: string[] = [];
+          for (let i = 0; i < zones.length; i++) {
+            const b = zones[i].bbox;
+            if (!bboxInGrid(b)) {
+              validationErrors.push(
+                `[${i}] bbox ${formatBbox(b)} is outside the 50x50 grid`,
+              );
+              continue;
+            }
+            // Intra-batch intersection
+            for (let j = 0; j < i; j++) {
+              if (bboxesIntersect(b, zones[j].bbox)) {
+                validationErrors.push(
+                  `[${i}] bbox ${formatBbox(b)} intersects [${j}] ${formatBbox(zones[j].bbox)}`,
+                );
+                break;
+              }
+            }
+            // Prior-delegation intersection
+            for (const prior of state.completedZoneBboxes) {
+              if (bboxesIntersect(b, prior)) {
+                validationErrors.push(
+                  `[${i}] bbox ${formatBbox(b)} intersects previously-delegated zone ${formatBbox(prior)}`,
+                );
+                break;
+              }
+            }
+          }
+
+          if (validationErrors.length > 0) {
+            const text =
+              `delegate_zones rejected — fix the bboxes and retry:\n${validationErrors.join('\n')}`;
+            await sendResult(text, true);
+            await sendCapNudgeIfHit();
+            continue;
+          }
+
+          // Adapter: Zone emits ZoneEvent, Mayor forwards as MayorStreamEvent.
+          const zoneAdapter = (e: ZoneEvent) => {
+            if (e.kind === 'tool_applied') {
+              onEvent({
+                kind: 'tool_applied',
+                tool_use_id: e.tool_use_id,
+                name: e.name,
+                input: e.input,
+                result: e.result,
+                source: 'zone',
+              });
+            } else if (e.kind === 'zone_message') {
+              onEvent({ kind: 'zone_message', text: e.text });
+            }
+          };
+
+          // Spawn all zones in parallel. Use allSettled so one zone crashing
+          // doesn't wipe the rest.
+          const zoneResults = await Promise.allSettled(
+            zones.map((z, i) =>
+              runZoneBuild(
+                z.bbox,
+                z.instructions,
+                state.city,
+                cachedEnvId as string, // ensureMayor ran before this, so envId is set
+                i,
+                zoneAdapter,
+              ),
+            ),
+          );
+
+          // Aggregate summary for the Mayor.
+          const lines: string[] = [];
+          let totalBuildings = 0;
+          for (let i = 0; i < zoneResults.length; i++) {
+            const res = zoneResults[i];
+            if (res.status === 'fulfilled') {
+              lines.push(res.value.summary);
+              totalBuildings += Object.values(res.value.counts).reduce((a, b) => a + b, 0);
+              // Track the zone's bbox so future delegate_zones calls can't overlap it.
+              state.completedZoneBboxes.push(res.value.bbox);
+            } else {
+              const msg = res.reason instanceof Error ? res.reason.message : String(res.reason);
+              lines.push(`zone ${i} FAILED: ${msg}`);
+            }
+          }
+          const text =
+            `All ${zones.length} zones completed. Total buildings: ${totalBuildings}.\n\n` +
+            lines.join('\n');
+          await sendResult(text, false);
           await sendCapNudgeIfHit();
           continue;
         }
