@@ -3,7 +3,7 @@ import type { BetaManagedAgentsStreamSessionEvents } from '@anthropic-ai/sdk/res
 import { applyToolCall, TOOL_SCHEMAS } from './tools';
 import type { ToolCall, ToolResult } from './tools';
 import { initCity } from '../all_types';
-import type { City } from '../all_types';
+import type { City, PropertyName, TileName } from '../all_types';
 
 // ============================================================
 // MODEL SWAP — one line to flip for demo day.
@@ -17,7 +17,7 @@ const MAX_CUSTOM_TOOL_USES = 70;
 
 const MAYOR_SYSTEM = `You are the Mayor of MetroPrompt, an AI city builder.
 
-Given a goal, build a functional city on a 50×50 grid by emitting tool calls. Aim for a balanced mix of residential (house, apartment), commercial (restaurant, grocery_store, shopping_mall, theme_park, office), civic (school, hospital, park), and infrastructure (fire_station, police_station, power_plant) buildings connected by a road network.
+Given a goal, build a functional city on a 50×50 grid by emitting tool calls. If being asked to build a city, aim for a balanced mix of residential (house, apartment), commercial (restaurant, grocery_store, shopping_mall, theme_park, office), civic (school, hospital, park), and infrastructure (fire_station, police_station, power_plant) buildings connected by a road network (unless otherwise specified).
 
 GRID
 - 50 columns (x: 0-49) × 50 rows (y: 0-49). Origin (0,0) is top-left.
@@ -35,14 +35,22 @@ RULES (enforced — violations return structured errors with coordinates)
 2. Footprints must fit in-bounds: x+w ≤ 50, y+h ≤ 50.
 3. If a tool fails, read the coordinates in the error message and retry at a valid position.
 
-STRATEGY
+The user may either want you to build out the whole city or may ask you to make improvements or build only a part of it. Based on the goal, decide on the right strategy and adapt as you go. The city evolves with each tool call, so always consider the current state when placing new elements.
+
+STRATEGY (if asked to build the whole city)
 1. Sketch block layout mentally before placing anything.
 2. Lay the road grid with place_tile_rect (use 'road_two_way'). Roads are typically 2 tiles wide — a horizontal road across the whole grid is ONE call: place_tile_rect("road_two_way", 0, 12, 49, 13).
 3. Lay 1-tile sidewalks on both sides of each road.
 4. Place buildings inside the resulting blocks.
 5. Batch tool calls per turn — emit several in a single response, don't wait for results.
-6. Aim for roughly 15-25 buildings total plus the road/sidewalk network.
-7. Call finish(reason) when you're satisfied with the city.
+6. Aim for AT LEAST 15-25 buildings total (unless otherwise specified) plus the road/sidewalk network (unless otherwise specified).
+7. Don't leave too much empty space — the city should feel dense and functional, not sparse and underdeveloped.
+8. Call finish(reason) when you're satisfied with the city.
+
+STRATEGY (if asked to build a specific building or amenity or small cluster or neighborhood or to make improvements)
+1. Sketch mentally before placing anything.
+2. Understand what has been done and what can be built around it — the city evolves, so adapt to the current state.
+3. 
 
 Be efficient. The city speaks for itself — no long explanations needed.`;
 
@@ -185,15 +193,25 @@ export type MayorStreamEvent =
   // Loop terminated.
   | { kind: 'done'; reason: string };
 
+// Singleton tool calls — passed straight through to applyToolCall.
 function parseToolCall(
   name: string,
   input: Record<string, unknown>,
 ): ToolCall | null {
-  // The Mayor's allowed tool names match our dispatcher exactly.
   if (name === 'place_property' || name === 'place_tile_rect' || name === 'finish') {
     return { name, input: input as never } as ToolCall;
   }
   return null;
+}
+
+type PlacePropertyItem = { property: PropertyName; x: number; y: number };
+type PlaceTileRectItem = { tile: TileName; x1: number; y1: number; x2: number; y2: number };
+
+function formatProperty(item: PlacePropertyItem): string {
+  return `place_property(${item.property}, ${item.x}, ${item.y})`;
+}
+function formatTileRect(item: PlaceTileRectItem): string {
+  return `place_tile_rect(${item.tile}, ${item.x1},${item.y1}–${item.x2},${item.y2})`;
 }
 
 export async function runMayorLoop(
@@ -225,46 +243,25 @@ export async function runMayorLoop(
 
       if (event.type === 'agent.custom_tool_use') {
         customToolUseCount++;
-        const call = parseToolCall(event.name, event.input);
-        const result: ToolResult = call
-          ? applyToolCall(state.city, call)
-          : {
-              ok: false,
-              error: `unknown tool '${event.name}'. Valid: place_property, place_tile_rect, finish`,
-            };
 
-        onEvent({
-          kind: 'tool_applied',
-          tool_use_id: event.id,
-          name: event.name,
-          input: event.input,
-          result,
-        });
+        // Helper: send a single text result back to MA.
+        const sendResult = async (text: string, isError: boolean) => {
+          await c.beta.sessions.events.send(sessionId, {
+            events: [
+              {
+                type: 'user.custom_tool_result',
+                custom_tool_use_id: event.id,
+                content: [{ type: 'text', text }],
+                is_error: isError,
+              },
+            ],
+          });
+        };
 
-        await c.beta.sessions.events.send(sessionId, {
-          events: [
-            {
-              type: 'user.custom_tool_result',
-              custom_tool_use_id: event.id,
-              content: [
-                {
-                  type: 'text',
-                  text: result.ok ? 'ok' : result.error,
-                },
-              ],
-              is_error: !result.ok,
-            },
-          ],
-        });
-
-        // finish tool → exit the loop on our side too.
-        if (result.ok && 'done' in result && result.done === true) {
-          onEvent({ kind: 'done', reason: 'finish tool called' });
-          return;
-        }
-
-        // Turn cap: send an interrupt + nudge if the agent is runaway.
-        if (customToolUseCount >= MAX_CUSTOM_TOOL_USES) {
+        // Helper: enforce the per-session tool-call cap (counts at the tool-call
+        // level, not the per-item level — a batch counts as one call).
+        const sendCapNudgeIfHit = async () => {
+          if (customToolUseCount < MAX_CUSTOM_TOOL_USES) return;
           await c.beta.sessions.events.send(sessionId, {
             events: [
               { type: 'user.interrupt' },
@@ -279,7 +276,102 @@ export async function runMayorLoop(
               },
             ],
           });
+        };
+
+        // ---- BATCH: place_properties ----
+        if (event.name === 'place_properties') {
+          const items =
+            (event.input as { properties?: PlacePropertyItem[] }).properties ?? [];
+          let okCount = 0;
+          const failures: string[] = [];
+
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const result = applyToolCall(state.city, {
+              name: 'place_property',
+              input: item,
+            });
+            // Per-item synthetic event so the frontend renders progressively
+            // and uses the existing place_property handler, not a new batch shape.
+            onEvent({
+              kind: 'tool_applied',
+              tool_use_id: `${event.id}#${i}`,
+              name: 'place_property',
+              input: item as unknown as Record<string, unknown>,
+              result,
+            });
+            if (result.ok) okCount++;
+            else failures.push(`[${i}] ${formatProperty(item)}: ${result.error}`);
+          }
+
+          const text =
+            failures.length === 0
+              ? `ok: all ${items.length} placed`
+              : `partial: ${okCount}/${items.length} placed\nfailed:\n${failures.join('\n')}`;
+          await sendResult(text, failures.length > 0);
+          await sendCapNudgeIfHit();
+          continue;
         }
+
+        // ---- BATCH: place_tile_rects ----
+        if (event.name === 'place_tile_rects') {
+          const items =
+            (event.input as { rects?: PlaceTileRectItem[] }).rects ?? [];
+          let okCount = 0;
+          const failures: string[] = [];
+
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const result = applyToolCall(state.city, {
+              name: 'place_tile_rect',
+              input: item,
+            });
+            onEvent({
+              kind: 'tool_applied',
+              tool_use_id: `${event.id}#${i}`,
+              name: 'place_tile_rect',
+              input: item as unknown as Record<string, unknown>,
+              result,
+            });
+            if (result.ok) okCount++;
+            else failures.push(`[${i}] ${formatTileRect(item)}: ${result.error}`);
+          }
+
+          const text =
+            failures.length === 0
+              ? `ok: all ${items.length} placed`
+              : `partial: ${okCount}/${items.length} placed\nfailed:\n${failures.join('\n')}`;
+          await sendResult(text, failures.length > 0);
+          await sendCapNudgeIfHit();
+          continue;
+        }
+
+        // ---- SINGLETON path (place_property / place_tile_rect / finish) ----
+        const call = parseToolCall(event.name, event.input);
+        const result: ToolResult = call
+          ? applyToolCall(state.city, call)
+          : {
+              ok: false,
+              error: `unknown tool '${event.name}'. Valid: place_property, place_properties, place_tile_rect, place_tile_rects, finish`,
+            };
+
+        onEvent({
+          kind: 'tool_applied',
+          tool_use_id: event.id,
+          name: event.name,
+          input: event.input,
+          result,
+        });
+
+        await sendResult(result.ok ? 'ok' : result.error, !result.ok);
+
+        // finish tool → exit the loop on our side too.
+        if (result.ok && 'done' in result && result.done === true) {
+          onEvent({ kind: 'done', reason: 'finish tool called' });
+          return;
+        }
+
+        await sendCapNudgeIfHit();
         continue;
       }
 

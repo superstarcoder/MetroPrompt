@@ -97,7 +97,12 @@ export function applyBatch(
 // ============================================================
 
 export const TOOL_SCHEMAS: Array<{
-  name: 'place_property' | 'place_tile_rect' | 'finish';
+  name:
+    | 'place_property'
+    | 'place_properties'
+    | 'place_tile_rect'
+    | 'place_tile_rects'
+    | 'finish';
   description: string;
   input_schema: {
     type: 'object';
@@ -108,7 +113,8 @@ export const TOOL_SCHEMAS: Array<{
   {
     name: 'place_property',
     description:
-      'Place a single building anchored at (x, y). The footprint extends down-right from the anchor. ' +
+      'Place a SINGLE building anchored at (x, y). For two or more buildings in the same turn, prefer place_properties (the batch variant) — fewer turns, less overhead. ' +
+      'Footprint extends down-right from the anchor. ' +
       '3x3 buildings: park, hospital, school, grocery_store, apartment, office, fire_station, police_station, power_plant, shopping_mall, theme_park. ' +
       '2x2 buildings: house, restaurant. ' +
       'Footprints must fit in-bounds and must not overlap any existing building.',
@@ -123,11 +129,36 @@ export const TOOL_SCHEMAS: Array<{
     },
   },
   {
+    name: 'place_properties',
+    description:
+      'Place MANY buildings in one tool call. PREFERRED when placing more than one building — collapses N place_property calls into one, saving turns. ' +
+      'Each item is validated independently against the current city state; partial success is reported back as text — successful items are placed, failed items are listed by index with their error so you can retry just those.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        properties: {
+          type: 'array',
+          minItems: 1,
+          items: {
+            type: 'object',
+            properties: {
+              property: { type: 'string', enum: Object.keys(PROPERTY_DEFAULTS) },
+              x: { type: 'integer', minimum: 0 },
+              y: { type: 'integer', minimum: 0 },
+            },
+            required: ['property', 'x', 'y'],
+          },
+        },
+      },
+      required: ['properties'],
+    },
+  },
+  {
     name: 'place_tile_rect',
     description:
-      'Fill an axis-aligned rectangle of ground tiles (both corners inclusive). ' +
+      'Fill a SINGLE axis-aligned rectangle of ground tiles (corners inclusive). For multiple rectangles in the same turn, prefer place_tile_rects. ' +
       'Use for roads, sidewalks, pavement, crosswalks. Later calls overwrite earlier ones. ' +
-      'A single cell is (x1==x2, y1==y2).',
+      'A single cell is x1=x2, y1=y2.',
     input_schema: {
       type: 'object',
       properties: {
@@ -138,6 +169,33 @@ export const TOOL_SCHEMAS: Array<{
         y2: { type: 'integer', minimum: 0 },
       },
       required: ['tile', 'x1', 'y1', 'x2', 'y2'],
+    },
+  },
+  {
+    name: 'place_tile_rects',
+    description:
+      'Fill MANY tile rectangles in one tool call. PREFERRED when laying a road grid or any multi-band tile pattern — collapses N place_tile_rect calls into one. ' +
+      'Each rect is validated independently; partial success is reported by index. Rects in the array are applied left-to-right, so later rects can overwrite earlier ones.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        rects: {
+          type: 'array',
+          minItems: 1,
+          items: {
+            type: 'object',
+            properties: {
+              tile: { type: 'string', enum: Object.keys(TILE_META) },
+              x1: { type: 'integer', minimum: 0 },
+              y1: { type: 'integer', minimum: 0 },
+              x2: { type: 'integer', minimum: 0 },
+              y2: { type: 'integer', minimum: 0 },
+            },
+            required: ['tile', 'x1', 'y1', 'x2', 'y2'],
+          },
+        },
+      },
+      required: ['rects'],
     },
   },
   {
