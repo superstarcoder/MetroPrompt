@@ -39,8 +39,8 @@ export const PROP_RENDER: Record<string, RenderOffset> = {
   restaurant_v3: { offsetX: 0, offsetY: -40, scale: 1.1 },
   home_v1:       { offsetX: -1, offsetY: -15, scale: 1 },
   home_v2:       { offsetX: 5, offsetY: -25, scale: 1.1 }, // Manually adjusted, do not change without testing
-  home_v3:       { offsetX: 0, offsetY: 0, scale: 1.0 },
-  home_v4:       { offsetX: 0, offsetY: 0, scale: 1.0 },
+  home_v3:       { offsetX: 0, offsetY: -17, scale: 1.0 },
+  home_v4:       { offsetX: 0, offsetY: -28, scale: 1.15 },
   shopping_mall: { offsetX: 0, offsetY: -9, scale: 1 },
   theme_park:    { offsetX: 0, offsetY: -14, scale: 1 },
 };
