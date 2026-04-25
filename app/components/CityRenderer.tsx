@@ -10,6 +10,7 @@ import {
   HOUSE_IMAGES,
   APARTMENT_IMAGES,
   OFFICE_IMAGES,
+  RESTAURANT_IMAGES,
   TREE_IMAGES,
   FLOWER_PATCH_IMAGES,
   BUSH_IMAGES,
@@ -47,9 +48,10 @@ function renderKey(imagePath: string): string {
 // Client picks variants at placement time. Purely cosmetic — server's city uses
 // PROPERTY_DEFAULTS images; the client mixes it up for visual variety.
 function pickPropertyImage(name: PropertyName): string {
-  if (name === 'house')     return HOUSE_IMAGES[Math.floor(Math.random() * HOUSE_IMAGES.length)];
-  if (name === 'apartment') return APARTMENT_IMAGES[Math.floor(Math.random() * APARTMENT_IMAGES.length)];
-  if (name === 'office')    return OFFICE_IMAGES[Math.floor(Math.random() * OFFICE_IMAGES.length)];
+  if (name === 'house')      return HOUSE_IMAGES[Math.floor(Math.random() * HOUSE_IMAGES.length)];
+  if (name === 'apartment')  return APARTMENT_IMAGES[Math.floor(Math.random() * APARTMENT_IMAGES.length)];
+  if (name === 'office')     return OFFICE_IMAGES[Math.floor(Math.random() * OFFICE_IMAGES.length)];
+  if (name === 'restaurant') return RESTAURANT_IMAGES[Math.floor(Math.random() * RESTAURANT_IMAGES.length)];
   return PROPERTY_DEFAULTS[name].image;
 }
 
@@ -61,6 +63,34 @@ function pickNatureImage(name: NatureName): string {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
+// Palette categories — each property name and nature name is one category. Multi-variant
+// items (house, apartment, office, tree) display every variant; single-variant items
+// fall back to PROPERTY_DEFAULTS / *_IMAGES with one entry.
+type PropPaletteCategory = { kind: 'property'; name: PropertyName; label: string; images: string[] };
+type NaturePaletteCategory = { kind: 'nature'; name: NatureName; label: string; images: string[] };
+
+const PROPERTY_PALETTE: PropPaletteCategory[] = [
+  { kind: 'property', name: 'house',          label: 'House',          images: HOUSE_IMAGES },
+  { kind: 'property', name: 'apartment',      label: 'Apartment',      images: APARTMENT_IMAGES },
+  { kind: 'property', name: 'office',         label: 'Office',         images: OFFICE_IMAGES },
+  { kind: 'property', name: 'park',           label: 'Park',           images: [PROPERTY_DEFAULTS.park.image] },
+  { kind: 'property', name: 'hospital',       label: 'Hospital',       images: [PROPERTY_DEFAULTS.hospital.image] },
+  { kind: 'property', name: 'school',         label: 'School',         images: [PROPERTY_DEFAULTS.school.image] },
+  { kind: 'property', name: 'grocery_store',  label: 'Grocery Store',  images: [PROPERTY_DEFAULTS.grocery_store.image] },
+  { kind: 'property', name: 'restaurant',     label: 'Restaurant',     images: RESTAURANT_IMAGES },
+  { kind: 'property', name: 'shopping_mall',  label: 'Shopping Mall',  images: [PROPERTY_DEFAULTS.shopping_mall.image] },
+  { kind: 'property', name: 'theme_park',     label: 'Theme Park',     images: [PROPERTY_DEFAULTS.theme_park.image] },
+  { kind: 'property', name: 'fire_station',   label: 'Fire Station',   images: [PROPERTY_DEFAULTS.fire_station.image] },
+  { kind: 'property', name: 'police_station', label: 'Police Station', images: [PROPERTY_DEFAULTS.police_station.image] },
+  { kind: 'property', name: 'power_plant',    label: 'Power Plant',    images: [PROPERTY_DEFAULTS.power_plant.image] },
+];
+
+const NATURE_PALETTE: NaturePaletteCategory[] = [
+  { kind: 'nature', name: 'tree',         label: 'Tree',    images: TREE_IMAGES },
+  { kind: 'nature', name: 'flower_patch', label: 'Flowers', images: FLOWER_PATCH_IMAGES },
+  { kind: 'nature', name: 'bush',         label: 'Bush',    images: BUSH_IMAGES },
+];
+
 // Preload every image the Mayor might need, so `tool_applied` events render immediately.
 const ALL_TILE_IMAGES = [...new Set(Object.values(TILE_META).map(m => m.image))];
 const ALL_PROP_IMAGES = [...new Set([
@@ -68,6 +98,7 @@ const ALL_PROP_IMAGES = [...new Set([
   ...HOUSE_IMAGES,
   ...APARTMENT_IMAGES,
   ...OFFICE_IMAGES,
+  ...RESTAURANT_IMAGES,
 ])];
 const ALL_NATURE_IMAGES = [...new Set([
   ...TREE_IMAGES,
@@ -311,6 +342,9 @@ export default function CityRenderer({
     sel: SelectedEntity;
     originalPos: Position;
     valid: boolean;
+    // True for palette-spawned entities. On invalid drop the entity is removed
+    // from the city instead of being snapped back to originalPos.
+    isNew: boolean;
   } | null>(null);
   const deleteBtnRef = useRef<HTMLButtonElement>(null);
   const editableRef = useRef(editable);
@@ -752,6 +786,120 @@ export default function CityRenderer({
     }
   }, [sessionId]);
 
+  // ------------------------------------------------------------
+  // Palette drag-from-sidebar (only relevant when editable)
+  // ------------------------------------------------------------
+
+  const onPalettePointerDown = useCallback(
+    (
+      e: React.PointerEvent<HTMLElement>,
+      item: { kind: 'property'; name: PropertyName; image: string } | { kind: 'nature'; name: NatureName; image: string },
+    ) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!editableRef.current) return;
+      const world = worldRef.current;
+      if (!world) return;
+      const city = cityRef.current;
+
+      // Initial position: the cell currently under the cursor (which may be
+      // behind the sidebar — that's fine, the sprite renders there until the user
+      // moves the cursor onto the open canvas).
+      const cell0 = screenToGrid(e.clientX, e.clientY, world.x, world.y, world.scale.x);
+      const initialPos: Position = cell0 ? { x: cell0.gx, y: cell0.gy } : { x: 0, y: 0 };
+
+      let sel: SelectedEntity;
+      if (item.kind === 'property') {
+        const def = PROPERTY_DEFAULTS[item.name];
+        const newProp: Property = {
+          ...def,
+          image: item.image,
+          position: initialPos,
+          current_occupants: [],
+        };
+        city.all_properties.push(newProp);
+        sel = { kind: 'property', data: newProp };
+      } else {
+        const newNat: Nature = {
+          name: item.name,
+          position: initialPos,
+          image: item.image,
+        };
+        city.all_nature.push(newNat);
+        sel = { kind: 'nature', data: newNat };
+      }
+
+      // Initial cursor is over the palette itself, so the placement starts invalid;
+      // releasing without moving discards the entity. The first onMove that lands
+      // on the canvas (away from any [data-mayor-ui] surface) recomputes validity.
+      entityDragRef.current = {
+        sel,
+        originalPos: initialPos,
+        valid: false,
+        isNew: true,
+      };
+      setSelectedEntity(sel);
+      scheduleRender();
+
+      const isOverUI = (ev: PointerEvent) => {
+        const el = document.elementFromPoint(ev.clientX, ev.clientY);
+        return !!el?.closest('[data-mayor-ui]');
+      };
+
+      const onMove = (ev: PointerEvent) => {
+        const drag = entityDragRef.current;
+        if (!drag) return;
+        if (isOverUI(ev)) {
+          // Hovering back over a UI surface (palette, header, delete btn) → invalid drop.
+          drag.valid = false;
+          scheduleRender();
+          return;
+        }
+        const cell = screenToGrid(ev.clientX, ev.clientY, world.x, world.y, world.scale.x);
+        if (!cell) {
+          drag.valid = false;
+          scheduleRender();
+          return;
+        }
+        const newPos = { x: cell.gx, y: cell.gy };
+        if (drag.sel.data.position.x === newPos.x && drag.sel.data.position.y === newPos.y) {
+          drag.valid = isPlacementValid(city, drag.sel, newPos);
+          scheduleRender();
+          return;
+        }
+        drag.sel.data.position = newPos;
+        drag.valid = isPlacementValid(city, drag.sel, newPos);
+        scheduleRender();
+      };
+
+      const onUp = () => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        const drag = entityDragRef.current;
+        if (!drag) return;
+        if (!drag.valid) {
+          // Discard the freshly-spawned entity.
+          if (drag.sel.kind === 'property') {
+            const idx = city.all_properties.indexOf(drag.sel.data);
+            if (idx >= 0) city.all_properties.splice(idx, 1);
+          } else {
+            const idx = city.all_nature.indexOf(drag.sel.data);
+            if (idx >= 0) city.all_nature.splice(idx, 1);
+          }
+          setSelectedEntity(null);
+        } else {
+          onCityChangeRef.current?.(city);
+        }
+        entityDragRef.current = null;
+        scheduleRender();
+      };
+
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+    },
+    [scheduleRender, setSelectedEntity],
+  );
+
   const onDeleteSelected = useCallback(() => {
     const sel = selectedEntityRef.current;
     if (!sel) return;
@@ -914,6 +1062,7 @@ export default function CityRenderer({
                 sel,
                 originalPos: { ...sel.data.position },
                 valid: true,
+                isNew: false,
               };
               mount.style.cursor = 'grabbing';
               scheduleRender();
@@ -971,6 +1120,8 @@ export default function CityRenderer({
       });
 
       const finishPointer = (e: PointerEvent) => {
+        // Palette drags handle their own cleanup with a dedicated window listener.
+        if (entityDragRef.current?.isNew) return;
         if (entityDragging && entityDragRef.current) {
           const drag = entityDragRef.current;
           if (!drag.valid) {
@@ -1109,6 +1260,85 @@ export default function CityRenderer({
         >
           ✕
         </button>
+      )}
+
+      {/* Palette sidebar — only when editing a saved city. Drag a thumbnail onto the canvas to place. */}
+      {editable && (
+        <div
+          data-mayor-ui
+          className="absolute top-4 right-4 w-56 flex flex-col bg-[#0b1220] text-white font-mono border-2 border-white/90"
+          style={{
+            maxHeight: 'calc(100vh - 2rem)',
+            imageRendering: 'pixelated',
+            boxShadow: '4px 4px 0 0 rgba(0,0,0,0.85), inset 0 0 0 2px #1a2540',
+          }}
+        >
+          <div className="flex items-center gap-1.5 px-3 py-2 bg-[#1a2540] border-b-2 border-white/90 uppercase tracking-[0.2em] text-[10px] shrink-0">
+            <span className="inline-block w-2 h-2 bg-fuchsia-400" />
+            <span>Palette</span>
+            <span className="opacity-40 text-[9px] tracking-normal ml-auto normal-case">drag onto map</span>
+          </div>
+          <div className="overflow-y-auto p-2.5 space-y-3 text-[10px]">
+            <div>
+              <div className="text-[9px] uppercase tracking-[0.3em] text-fuchsia-300/80 mb-1.5">▣ Buildings</div>
+              <div className="space-y-2">
+                {PROPERTY_PALETTE.map(cat => (
+                  <div key={cat.name}>
+                    <div className="text-[9px] uppercase tracking-wider text-white/55 mb-0.5">{cat.label}</div>
+                    <div className="flex flex-wrap gap-1">
+                      {cat.images.map(img => (
+                        <div
+                          key={img}
+                          onPointerDown={(e) => onPalettePointerDown(e, { kind: 'property', name: cat.name, image: img })}
+                          title={`${cat.label} — drag to place`}
+                          className="w-12 h-12 flex items-center justify-center cursor-grab active:cursor-grabbing border border-white/30 bg-black/40 hover:border-fuchsia-400 hover:bg-fuchsia-500/10 transition-colors"
+                          style={{ touchAction: 'none' }}
+                        >
+                          <img
+                            src={img}
+                            alt={cat.label}
+                            draggable={false}
+                            className="max-w-full max-h-full"
+                            style={{ imageRendering: 'pixelated' }}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="text-[9px] uppercase tracking-[0.3em] text-emerald-300/80 mb-1.5">✿ Nature</div>
+              <div className="space-y-2">
+                {NATURE_PALETTE.map(cat => (
+                  <div key={cat.name}>
+                    <div className="text-[9px] uppercase tracking-wider text-white/55 mb-0.5">{cat.label}</div>
+                    <div className="flex flex-wrap gap-1">
+                      {cat.images.map(img => (
+                        <div
+                          key={img}
+                          onPointerDown={(e) => onPalettePointerDown(e, { kind: 'nature', name: cat.name, image: img })}
+                          title={`${cat.label} — drag to place`}
+                          className="w-12 h-12 flex items-center justify-center cursor-grab active:cursor-grabbing border border-white/30 bg-black/40 hover:border-emerald-400 hover:bg-emerald-500/10 transition-colors"
+                          style={{ touchAction: 'none' }}
+                        >
+                          <img
+                            src={img}
+                            alt={cat.label}
+                            draggable={false}
+                            className="max-w-full max-h-full"
+                            style={{ imageRendering: 'pixelated' }}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Read-only header for saved-city viewer */}

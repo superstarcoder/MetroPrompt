@@ -70,17 +70,30 @@ export type Property = {
 export const HOUSE_IMAGES = [
   "/assets/home_v1_2_2.png",
   "/assets/home_v2_2_2.png",
+  "/assets/home_v3_2_2.png",
+  "/assets/home_v4_2_2.png",
 ];
 
 export const APARTMENT_IMAGES = [
   "/assets/apartment_v1_3_3.png",
   "/assets/apartment_v2_3_3.png",
+  "/assets/apartment_v3_3_3.png",
+  "/assets/apartment_v4_3_3.png",
+  "/assets/apartment_v5_3_3.png",
+  "/assets/apartment_v6_3_3.png",
+  "/assets/apartment_v7_3_3.png",
 ];
 
 export const OFFICE_IMAGES = [
   "/assets/office_v1_3_3.png",
   "/assets/office_v2_3_3.png",
   "/assets/office_v3_3_3.png",
+];
+
+export const RESTAURANT_IMAGES = [
+  "/assets/restaurant_v1_2_2.png",
+  "/assets/restaurant_v2_2_2.png",
+  "/assets/restaurant_v3_2_2.png",
 ];
 
 export const TREE_IMAGES = [
@@ -185,7 +198,7 @@ export const PROPERTY_DEFAULTS: Record<PropertyName, Omit<Property, "position" |
     boredom_decrease: 5,
     hunger_decrease: 10,
     tiredness_decrease: 0,
-    image: "/assets/restaurant_2_2.png",
+    image: RESTAURANT_IMAGES[0],
   },
   fire_station: {
     name: "fire_station",
@@ -564,6 +577,7 @@ function pickPropertyImage(name: PropertyName, strategy: "default" | "random"): 
     name === "house" ? HOUSE_IMAGES :
     name === "apartment" ? APARTMENT_IMAGES :
     name === "office" ? OFFICE_IMAGES :
+    name === "restaurant" ? RESTAURANT_IMAGES :
     null;
   return arr ? arr[Math.floor(Math.random() * arr.length)] : PROPERTY_DEFAULTS[name].image;
 }
