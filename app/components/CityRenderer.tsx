@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -22,6 +23,8 @@ import {
   deleteNatureAt,
 } from '@/lib/all_types';
 import type { City, Nature, NatureName, Property, PropertyName, TileName } from '@/lib/all_types';
+import { saveCity } from '@/lib/cityStore';
+import type { Position } from '@/lib/all_types';
 
 const TILE_W = 64;
 const TILE_H = 32;
@@ -71,6 +74,89 @@ const ALL_NATURE_IMAGES = [...new Set([
   ...FLOWER_PATCH_IMAGES,
   ...BUSH_IMAGES,
 ])];
+
+// ============================================================
+// EDIT-MODE HELPERS (hit testing, drag validation)
+// ============================================================
+
+// Inverse of gridToScreen. Converts a screen-space point (relative to the canvas
+// element) into a grid cell, accounting for world pan/zoom. Returns null if outside
+// the GRID_SIZE × GRID_SIZE bounds.
+function screenToGrid(
+  screenX: number,
+  screenY: number,
+  worldX: number,
+  worldY: number,
+  worldScale: number,
+): { gx: number; gy: number } | null {
+  const wx = (screenX - worldX) / worldScale;
+  const wy = (screenY - worldY) / worldScale;
+  // Diamond center is at gridToScreen(gx,gy) + (0, TILE_H/2). Solve for gx,gy.
+  const cy = wy - TILE_H / 2;
+  const fgx = cy / TILE_H + wx / TILE_W;
+  const fgy = cy / TILE_H - wx / TILE_W;
+  const gx = Math.round(fgx);
+  const gy = Math.round(fgy);
+  if (gx < 0 || gy < 0 || gx >= GRID_SIZE || gy >= GRID_SIZE) return null;
+  return { gx, gy };
+}
+
+type SelectedEntity =
+  | { kind: 'property'; data: Property }
+  | { kind: 'nature'; data: Nature };
+
+// Returns the entity occupying (gx, gy), or null. Nature is checked first because
+// it can't legally overlap properties at placement time, but if data did get out
+// of sync we'd still prefer the smaller selectable target.
+function entityAt(city: City, gx: number, gy: number): SelectedEntity | null {
+  for (const n of city.all_nature) {
+    if (n.position.x === gx && n.position.y === gy) return { kind: 'nature', data: n };
+  }
+  for (const p of city.all_properties) {
+    const dx = gx - p.position.x;
+    const dy = gy - p.position.y;
+    if (dx >= 0 && dx < p.width && dy >= 0 && dy < p.height) return { kind: 'property', data: p };
+  }
+  return null;
+}
+
+// Validates moving `entity` to `newPos`. In-bounds + no overlap with other entities.
+// (Does NOT enforce grass-only — editing should be permissive; users can drop on roads.)
+function isPlacementValid(city: City, sel: SelectedEntity, newPos: Position): boolean {
+  if (sel.kind === 'property') {
+    const p = sel.data;
+    if (newPos.x < 0 || newPos.y < 0) return false;
+    if (newPos.x + p.width > GRID_SIZE || newPos.y + p.height > GRID_SIZE) return false;
+    for (const other of city.all_properties) {
+      if (other === p) continue;
+      const xOverlap =
+        newPos.x < other.position.x + other.width &&
+        newPos.x + p.width > other.position.x;
+      const yOverlap =
+        newPos.y < other.position.y + other.height &&
+        newPos.y + p.height > other.position.y;
+      if (xOverlap && yOverlap) return false;
+    }
+    for (const n of city.all_nature) {
+      const dx = n.position.x - newPos.x;
+      const dy = n.position.y - newPos.y;
+      if (dx >= 0 && dx < p.width && dy >= 0 && dy < p.height) return false;
+    }
+    return true;
+  } else {
+    if (newPos.x < 0 || newPos.y < 0 || newPos.x >= GRID_SIZE || newPos.y >= GRID_SIZE) return false;
+    for (const other of city.all_nature) {
+      if (other === sel.data) continue;
+      if (other.position.x === newPos.x && other.position.y === newPos.y) return false;
+    }
+    for (const p of city.all_properties) {
+      const dx = newPos.x - p.position.x;
+      const dy = newPos.y - p.position.y;
+      if (dx >= 0 && dx < p.width && dy >= 0 && dy < p.height) return false;
+    }
+    return true;
+  }
+}
 
 // ============================================================
 // SSE EVENT SHAPES (mirror MayorStreamEvent in lib/agent/mayor.ts)
@@ -175,24 +261,67 @@ function formatToolInput(name: string, input: Record<string, unknown>): string {
 
 // ============================================================
 
-export default function CityRenderer() {
+export type CityRendererProps = {
+  // When true, the chat panel + composer are hidden and no SSE stream is opened.
+  // Used by /cities/[id] to display a saved city as a static scene.
+  readOnly?: boolean;
+  // Seed the city instead of starting from empty grass. Used in readOnly mode.
+  initialCity?: City;
+  // Header label shown in readOnly mode (e.g. saved city name).
+  cityName?: string;
+  // Enable hover/click/drag editing of properties + nature. Pairs with onCityChange.
+  editable?: boolean;
+  // Called after every mutation (delete, drag-drop) so callers can persist.
+  onCityChange?: (city: City) => void;
+};
+
+export default function CityRenderer({
+  readOnly = false,
+  initialCity,
+  cityName,
+  editable = false,
+  onCityChange,
+}: CityRendererProps = {}) {
   const mountRef = useRef<HTMLDivElement>(null);
   const gridLinesRef = useRef<any>(null);
   const [showGrid, setShowGrid] = useState(false);
 
   // City held in a ref so SSE callbacks can mutate it without triggering React
   // re-renders. Pixi re-render is driven by scheduleRender().
-  const cityRef = useRef<City>(initCity(GRID_SIZE));
+  const cityRef = useRef<City>(initialCity ?? initCity(GRID_SIZE));
 
   // Pixi refs used by the render loop.
   const pixiModRef = useRef<any>(null);
   const worldRef = useRef<any>(null);
   const spritesLayerRef = useRef<any>(null);
+  const highlightLayerRef = useRef<any>(null);
+  const appRef = useRef<any>(null);
   const tileTexRef = useRef<Record<string, any>>({});
   const propTexRef = useRef<Record<string, any>>({});
   const natureTexRef = useRef<Record<string, any>>({});
   const texturesReadyRef = useRef(false);
   const rafHandleRef = useRef<number | null>(null);
+
+  // Edit-mode state. Refs are read by Pixi event handlers (which capture stale
+  // closures); state mirrors are used in JSX.
+  const [selectedEntity, setSelectedEntityState] = useState<SelectedEntity | null>(null);
+  const hoveredEntityRef = useRef<SelectedEntity | null>(null);
+  const selectedEntityRef = useRef<SelectedEntity | null>(null);
+  const entityDragRef = useRef<{
+    sel: SelectedEntity;
+    originalPos: Position;
+    valid: boolean;
+  } | null>(null);
+  const deleteBtnRef = useRef<HTMLButtonElement>(null);
+  const editableRef = useRef(editable);
+  useEffect(() => { editableRef.current = editable; }, [editable]);
+  const onCityChangeRef = useRef(onCityChange);
+  useEffect(() => { onCityChangeRef.current = onCityChange; }, [onCityChange]);
+
+  const setSelectedEntity = useCallback((e: SelectedEntity | null) => {
+    selectedEntityRef.current = e;
+    setSelectedEntityState(e);
+  }, []);
 
   // UI state.
   const [status, setStatus] = useState<Status>('idle');
@@ -206,6 +335,11 @@ export default function CityRenderer() {
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const feedIdRef = useRef(0);
   const chatScrollRef = useRef<HTMLDivElement>(null);
+
+  // Save-city UI (only shown in the post-build `done` dock)
+  const [saveName, setSaveName] = useState('');
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const [originalGoal, setOriginalGoal] = useState<string>('');
 
   // Chat panel — draggable + minimizable.
   const PANEL_WIDTH_PX = 26 * 16; // matches w-[26rem]
@@ -310,14 +444,44 @@ export default function CityRenderer() {
   const doRender = useCallback(() => {
     const mod = pixiModRef.current;
     const spritesLayer = spritesLayerRef.current;
+    const highlightLayer = highlightLayerRef.current;
     if (!mod || !spritesLayer || !texturesReadyRef.current) return;
     const { Sprite } = mod;
     const city = cityRef.current;
     const tileTex = tileTexRef.current;
     const propTex = propTexRef.current;
     const natureTex = natureTexRef.current;
+    const drag = entityDragRef.current;
+    const dragEntity = drag?.sel.data ?? null;
+    const hovered = hoveredEntityRef.current;
+    const selected = selectedEntityRef.current;
 
     spritesLayer.removeChildren();
+    if (highlightLayer) highlightLayer.removeChildren();
+
+    // Spawn a tinted copy of `srcSprite` into the topmost highlight layer.
+    // Uses screen blend so the underlying sprite shows through with a wash.
+    const addHighlightCopy = (srcSprite: any, tex: any, color: number, alpha: number) => {
+      if (!highlightLayer) return;
+      const copy = new Sprite(tex);
+      copy.anchor.copyFrom(srcSprite.anchor);
+      copy.scale.copyFrom(srcSprite.scale);
+      copy.x = srcSprite.x;
+      copy.y = srcSprite.y;
+      copy.tint = color;
+      copy.alpha = alpha;
+      copy.blendMode = 'screen';
+      highlightLayer.addChild(copy);
+    };
+
+    const highlightFor = (entity: Property | Nature): { color: number; alpha: number } | null => {
+      if (drag) return null; // suppressed during drag — green/red tint on the sprite handles it
+      if (selected && selected.data === entity) return { color: 0xffff00, alpha: 0.55 }; // yellow
+      if (hovered && hovered.data === entity && hovered.data !== selected?.data) {
+        return { color: 0xffffff, alpha: 0.4 }; // soft white
+      }
+      return null;
+    };
 
     // Pass 1 — tiles (ground layer).
     for (let gy = 0; gy < GRID_SIZE; gy++) {
@@ -361,7 +525,13 @@ export default function CityRenderer() {
         sprite.scale.y = sprite.scale.x;
         sprite.x = x + cfg.offsetX;
         sprite.y = y - (p.width - 1) * TILE_H + cfg.offsetY;
+        if (dragEntity === p) {
+          sprite.tint = drag!.valid ? 0x88ff88 : 0xff8888;
+          sprite.alpha = 0.85;
+        }
         spritesLayer.addChild(sprite);
+        const hl = highlightFor(p);
+        if (hl) addHighlightCopy(sprite, tex, hl.color, hl.alpha);
       }
       if (d.kind === 'nature') {
         const n = d.data;
@@ -374,7 +544,13 @@ export default function CityRenderer() {
         sprite.scale.set((TILE_W / (tex as any).width) * cfg.scale);
         sprite.x = x + cfg.offsetX;
         sprite.y = y + cfg.offsetY;
+        if (dragEntity === n) {
+          sprite.tint = drag!.valid ? 0x88ff88 : 0xff8888;
+          sprite.alpha = 0.85;
+        }
         spritesLayer.addChild(sprite);
+        const hl = highlightFor(n);
+        if (hl) addHighlightCopy(sprite, tex, hl.color, hl.alpha);
       }
     }
   }, []);
@@ -508,6 +684,9 @@ export default function CityRenderer() {
     scheduleRender();
     setFeed([]);
     setStatus('running');
+    setOriginalGoal(goal.trim());
+    setSaveName('');
+    setSaveState('idle');
 
     try {
       const resp = await fetch('/api/mayor', {
@@ -573,6 +752,40 @@ export default function CityRenderer() {
     }
   }, [sessionId]);
 
+  const onDeleteSelected = useCallback(() => {
+    const sel = selectedEntityRef.current;
+    if (!sel) return;
+    const city = cityRef.current;
+    if (sel.kind === 'property') {
+      const idx = city.all_properties.indexOf(sel.data);
+      if (idx >= 0) city.all_properties.splice(idx, 1);
+    } else {
+      const idx = city.all_nature.indexOf(sel.data);
+      if (idx >= 0) city.all_nature.splice(idx, 1);
+    }
+    setSelectedEntity(null);
+    hoveredEntityRef.current = null;
+    onCityChangeRef.current?.(city);
+    scheduleRender();
+  }, [setSelectedEntity, scheduleRender]);
+
+  const onSaveCity = useCallback(() => {
+    const name = saveName.trim();
+    if (!name) return;
+    setSaveState('saving');
+    try {
+      saveCity({
+        name,
+        originalGoal,
+        city: cityRef.current,
+      });
+      setSaveState('saved');
+    } catch (e) {
+      console.error('[save]', e);
+      setSaveState('idle');
+    }
+  }, [saveName, originalGoal]);
+
   const onRedirect = useCallback(async () => {
     if (!sessionId || !redirectText.trim()) return;
     try {
@@ -600,6 +813,7 @@ export default function CityRenderer() {
     if (!mountRef.current) return;
     const mount = mountRef.current;
     let destroyed = false;
+    const cleanupFns: Array<() => void> = [];
 
     async function init() {
       const pixi = await import('pixi.js');
@@ -617,6 +831,7 @@ export default function CityRenderer() {
       });
       if (destroyed) { app.destroy(true); return; }
       mount.appendChild(app.canvas as HTMLCanvasElement);
+      appRef.current = app;
 
       // Preload every possible texture upfront.
       await Promise.all([
@@ -627,7 +842,7 @@ export default function CityRenderer() {
       if (destroyed) { app.destroy(true); return; }
       texturesReadyRef.current = true;
 
-      // world > spritesLayer (cleared on re-render) + gridLines (persistent)
+      // world > spritesLayer (cleared on re-render) + gridLines (persistent) + highlightLayer (topmost, tinted sprite copies)
       const world = new Container();
       const spritesLayer = new Container();
       world.addChild(spritesLayer);
@@ -656,25 +871,177 @@ export default function CityRenderer() {
       gridLinesRef.current = gridLines;
       world.addChild(gridLines);
 
+      // Highlight layer — topmost so hover/selected tints overlay everything else.
+      const highlightLayer = new Container();
+      world.addChild(highlightLayer);
+      highlightLayerRef.current = highlightLayer;
+
       // Initial render (empty grass at this point).
       doRender();
 
-      // Pan — ignore clicks that started over the UI panel.
-      let dragging = false; let lastX = 0; let lastY = 0;
+      // Pointer state. Two mutually exclusive gestures: panning (world drag)
+      // and entityDragging (move a selected property/nature). Edit-mode hover
+      // also runs in pointermove when no buttons are held.
+      let panning = false;
+      let entityDragging = false;
+      let pointerStartX = 0, pointerStartY = 0;
+      let panLastX = 0, panLastY = 0;
+      let pointerDownDidHitEntity = false;
+      let pointerMoved = false;
+      const CLICK_PIXEL_THRESHOLD = 4;
+
       mount.addEventListener('pointerdown', (e) => {
         const target = e.target as HTMLElement;
         if (target.closest('[data-mayor-ui]')) return;
-        dragging = true; lastX = e.clientX; lastY = e.clientY; mount.style.cursor = 'grabbing';
+
+        pointerStartX = e.clientX;
+        pointerStartY = e.clientY;
+        pointerMoved = false;
+        pointerDownDidHitEntity = false;
+
+        // Edit mode: if pointerdown lands on the currently-selected entity,
+        // start a drag-to-move instead of panning. A click that doesn't move
+        // (no drag distance) is treated as a no-op (still selected).
+        if (editableRef.current && selectedEntityRef.current) {
+          const sel = selectedEntityRef.current;
+          const cell = screenToGrid(e.clientX, e.clientY, world.x, world.y, world.scale.x);
+          if (cell) {
+            const hit = entityAt(cityRef.current, cell.gx, cell.gy);
+            if (hit && hit.data === sel.data) {
+              pointerDownDidHitEntity = true;
+              entityDragging = true;
+              entityDragRef.current = {
+                sel,
+                originalPos: { ...sel.data.position },
+                valid: true,
+              };
+              mount.style.cursor = 'grabbing';
+              scheduleRender();
+              return;
+            }
+          }
+        }
+
+        panning = true;
+        panLastX = e.clientX;
+        panLastY = e.clientY;
+        mount.style.cursor = 'grabbing';
       });
+
       mount.addEventListener('pointermove', (e) => {
-        if (!dragging) return;
-        world.x += e.clientX - lastX; world.y += e.clientY - lastY;
-        lastX = e.clientX; lastY = e.clientY;
+        if (!pointerMoved) {
+          const dx = e.clientX - pointerStartX;
+          const dy = e.clientY - pointerStartY;
+          if (dx * dx + dy * dy > CLICK_PIXEL_THRESHOLD * CLICK_PIXEL_THRESHOLD) {
+            pointerMoved = true;
+          }
+        }
+
+        if (panning) {
+          world.x += e.clientX - panLastX;
+          world.y += e.clientY - panLastY;
+          panLastX = e.clientX;
+          panLastY = e.clientY;
+          return;
+        }
+
+        if (entityDragging && entityDragRef.current) {
+          const drag = entityDragRef.current;
+          const cell = screenToGrid(e.clientX, e.clientY, world.x, world.y, world.scale.x);
+          if (!cell) return;
+          const newPos = { x: cell.gx, y: cell.gy };
+          if (drag.sel.data.position.x === newPos.x && drag.sel.data.position.y === newPos.y) return;
+          drag.sel.data.position = newPos;
+          drag.valid = isPlacementValid(cityRef.current, drag.sel, newPos);
+          scheduleRender();
+          return;
+        }
+
+        // Hover (no buttons pressed) — only meaningful in edit mode.
+        if (editableRef.current && e.buttons === 0) {
+          const cell = screenToGrid(e.clientX, e.clientY, world.x, world.y, world.scale.x);
+          const hit = cell ? entityAt(cityRef.current, cell.gx, cell.gy) : null;
+          const prev = hoveredEntityRef.current;
+          if ((prev?.data ?? null) !== (hit?.data ?? null)) {
+            hoveredEntityRef.current = hit;
+            mount.style.cursor = hit ? 'pointer' : 'grab';
+            scheduleRender();
+          }
+        }
       });
-      const stopDrag = () => { dragging = false; mount.style.cursor = 'grab'; };
-      mount.addEventListener('pointerup', stopDrag);
-      mount.addEventListener('pointerleave', stopDrag);
+
+      const finishPointer = (e: PointerEvent) => {
+        if (entityDragging && entityDragRef.current) {
+          const drag = entityDragRef.current;
+          if (!drag.valid) {
+            drag.sel.data.position = drag.originalPos;
+          } else {
+            const moved =
+              drag.originalPos.x !== drag.sel.data.position.x ||
+              drag.originalPos.y !== drag.sel.data.position.y;
+            if (moved) onCityChangeRef.current?.(cityRef.current);
+          }
+          entityDragRef.current = null;
+          entityDragging = false;
+          scheduleRender();
+        }
+
+        if (panning) {
+          panning = false;
+        }
+
+        // Treat a no-drag pointerdown+up as a click — toggle selection.
+        if (editableRef.current && !pointerMoved && !pointerDownDidHitEntity) {
+          const cell = screenToGrid(e.clientX, e.clientY, world.x, world.y, world.scale.x);
+          const hit = cell ? entityAt(cityRef.current, cell.gx, cell.gy) : null;
+          if (hit) {
+            // Toggle off if clicking the same selected entity.
+            const sel = selectedEntityRef.current;
+            if (sel?.data === hit.data) {
+              setSelectedEntity(null);
+            } else {
+              setSelectedEntity(hit);
+            }
+          } else {
+            setSelectedEntity(null);
+          }
+          scheduleRender();
+        }
+
+        mount.style.cursor = 'grab';
+      };
+
+      // Use window-level pointerup so dropping outside the canvas still completes
+      // the gesture cleanly (otherwise drag/pan can get stuck).
+      window.addEventListener('pointerup', finishPointer);
+      cleanupFns.push(() => window.removeEventListener('pointerup', finishPointer));
       mount.style.cursor = 'grab';
+
+      // Position the HTML delete-button overlay each frame so it tracks pan/zoom.
+      const repositionDeleteBtn = () => {
+        const btn = deleteBtnRef.current;
+        if (!btn) return;
+        const sel = selectedEntityRef.current;
+        // Hide while dragging or when nothing is selected.
+        if (!sel || entityDragRef.current) {
+          if (btn.style.display !== 'none') btn.style.display = 'none';
+          return;
+        }
+        const pos = sel.data.position;
+        const w = sel.kind === 'property' ? sel.data.width  : 1;
+        const h = sel.kind === 'property' ? sel.data.height : 1;
+        // South vertex of the back-most cell of the footprint = visually below the entity.
+        const lastCellX = pos.x + w - 1;
+        const lastCellY = pos.y + h - 1;
+        const grid = gridToScreen(lastCellX, lastCellY);
+        const sx = grid.x * world.scale.x + world.x;
+        const sy = (grid.y + TILE_H) * world.scale.x + world.y;
+        btn.style.display = 'flex';
+        btn.style.left = `${sx}px`;
+        btn.style.top = `${sy + 8}px`;
+      };
+      app.ticker.add(repositionDeleteBtn);
+      cleanupFns.push(() => app.ticker.remove(repositionDeleteBtn));
 
       // Zoom toward cursor.
       mount.addEventListener('wheel', (e) => {
@@ -696,6 +1063,9 @@ export default function CityRenderer() {
       destroyed = true;
       esRef.current?.close();
       if (rafHandleRef.current != null) cancelAnimationFrame(rafHandleRef.current);
+      for (const fn of cleanupFns) {
+        try { fn(); } catch { /* ignore */ }
+      }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -719,7 +1089,46 @@ export default function CityRenderer() {
     <div className="relative w-full h-full">
       <div ref={mountRef} className="w-full h-full" />
 
+      {/* Floating delete button — positioned each frame by the Pixi ticker */}
+      {editable && selectedEntity && (
+        <button
+          data-mayor-ui
+          ref={deleteBtnRef}
+          onClick={(e) => { e.stopPropagation(); onDeleteSelected(); }}
+          onPointerDown={(e) => e.stopPropagation()}
+          title="Delete this item"
+          className="absolute z-10 w-6 h-6 flex items-center justify-center bg-rose-500 hover:bg-rose-400 text-white text-sm font-bold border-2 border-white/90 rounded-full leading-none transition-colors"
+          style={{
+            left: 0,
+            top: 0,
+            display: 'none',
+            transform: 'translate(-50%, 0)',
+            boxShadow: '2px 2px 0 0 rgba(0,0,0,0.85)',
+            imageRendering: 'pixelated',
+          }}
+        >
+          ✕
+        </button>
+      )}
+
+      {/* Read-only header for saved-city viewer */}
+      {readOnly && (
+        <div
+          data-mayor-ui
+          className="absolute top-4 left-4 flex items-center gap-3 px-4 py-2 bg-[#0b1220] text-white border-2 border-white/90 font-mono text-[11px] uppercase tracking-[0.2em]"
+          style={{ boxShadow: '3px 3px 0 0 rgba(0,0,0,0.85)' }}
+        >
+          <Link href="/cities" className="text-white/70 hover:text-white">← My Cities</Link>
+          <span className="opacity-40">|</span>
+          <span className="flex items-center gap-1.5">
+            <span className="inline-block w-2 h-2 bg-fuchsia-400" />
+            <span className="text-fuchsia-300">{cityName ?? 'Saved City'}</span>
+          </span>
+        </div>
+      )}
+
       {/* Unified chat panel — draggable + minimizable, pixel themed */}
+      {!readOnly && (
       <div
         data-mayor-ui
         ref={panelRef}
@@ -879,6 +1288,36 @@ export default function CityRenderer() {
             </>
           ) : status === 'done' && sessionId ? (
             <>
+              {/* Save card */}
+              <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-lime-300">
+                <span className="inline-block w-2 h-2 bg-lime-400" />
+                Save this city locally
+              </div>
+              <div className="flex gap-1.5">
+                <input
+                  type="text"
+                  value={saveName}
+                  onChange={(e) => { setSaveName(e.target.value); if (saveState === 'saved') setSaveState('idle'); }}
+                  placeholder="name your city…"
+                  className="flex-1 min-w-0 px-2 py-1.5 bg-black/60 text-white text-xs border-2 border-white/40 focus:border-lime-400 outline-none"
+                />
+                <button
+                  onClick={onSaveCity}
+                  disabled={!saveName.trim() || saveState === 'saving'}
+                  className="shrink-0 px-3 py-1.5 bg-lime-400 hover:bg-lime-300 disabled:bg-white/10 disabled:text-white/40 text-black text-[10px] font-bold uppercase tracking-wider border-2 border-white/90 transition-colors"
+                  style={{ boxShadow: '3px 3px 0 0 rgba(0,0,0,0.85)' }}
+                >
+                  {saveState === 'saved' ? '✓ saved' : saveState === 'saving' ? '…' : '💾 save'}
+                </button>
+              </div>
+              {saveState === 'saved' && (
+                <div className="text-[10px] text-lime-300/90">
+                  Saved · <Link href="/cities" className="underline hover:text-lime-200">view My Cities →</Link>
+                </div>
+              )}
+
+              <div className="border-t border-white/15 my-1" />
+
               <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-sky-300">
                 <span className="inline-block w-2 h-2 bg-sky-400" />
                 Build complete — send a follow-up to edit the city
@@ -940,6 +1379,7 @@ export default function CityRenderer() {
         </div>
         </>)}
       </div>
+      )}
 
       {/* Grid toggle — pixel themed */}
       <button
