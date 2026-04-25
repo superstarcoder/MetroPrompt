@@ -1,7 +1,7 @@
 # MetroPrompt — Agentic City Builder
 
 ## Project Overview
-A pixel-art agentic city builder for a hackathon. The user prompts a Mayor agent (Claude Managed Agents) which lays out a 50×50 city via tool calls, streaming the build live to the browser. Future stages: citizens simulate for 7 days, then the Mayor generates a report. Multi-agent split (Mayor → Zone + Infrastructure sub-agents) is a Stage 5 polish item.
+A pixel-art agentic city builder for a hackathon. The user prompts a **Mayor agent** (Claude Managed Agents) which lays the road network and partitions the grid, then delegates each region in parallel to **Zone sub-agents** that fill it in with specialized attention. The build streams live to the browser via SSE. Future stages: citizens simulate for 7 days, then the Mayor generates a report.
 
 ## Hackathon Context
 - **Prompt theme:** "Build For What's Next" — interfaces without a name, workflows from a few years out
@@ -21,7 +21,7 @@ MetroPrompt/
   assets/                — all pixel art sprites
   app/                   — Next.js application
     AGENTS.md            — Next.js 16 warning (breaking changes)
-    .env.local           — ANTHROPIC_API_KEY, MAYOR_AGENT_ID, MAYOR_ENV_ID (do not commit)
+    .env.local           — ANTHROPIC_API_KEY, MAYOR_AGENT_ID, MAYOR_ENV_ID, ZONE_AGENT_ID (do not commit)
     app/
       page.tsx           — server component entry point
       layout.tsx
@@ -40,9 +40,10 @@ MetroPrompt/
       all_types.tsx      — simulation data schema, source of truth
       renderConfig.ts    — per-sprite render offsets and scale (visual tuning only)
       agent/
-        tools.ts         — ToolCall union, TOOL_SCHEMAS, applyToolCall dispatcher
+        tools.ts         — ToolCall union, TOOL_SCHEMAS (Mayor) + ZONE_TOOL_SCHEMAS (Zone, no delegate_zones), applyToolCall
         observation.ts   — buildObservation (dormant; kept for future prompt-pumped variants)
-        mayor.ts         — MAYOR_MODEL const, ensureMayor, createMayorSession, runMayorLoop, sendInterrupt, sendRedirect
+        mayor.ts         — MAYOR_MODEL const, MAYOR_SYSTEM, ensureMayor, createMayorSession, runMayorLoop, sendInterrupt, sendRedirect; delegate_zones handler (intersection check + parallel Zone fan-out)
+        zone.ts          — ZONE_MODEL const, ZONE_SYSTEM, ensureZone, runZoneBuild (bbox-enforced custom-tool loop, returns summary)
     scripts/
       test_step1.ts      — npx tsx smoke test for the tool dispatcher + observation builder
     public/assets/       — sprites served to browser
@@ -55,19 +56,24 @@ MetroPrompt/
 - This three-layer pattern is required: `ssr: false` is not allowed in server components, so the dynamic import must live in a client component wrapper
 
 ## Agent Architecture
-Single **Mayor agent** running on Claude Managed Agents. Zone / Infrastructure sub-agents (multi-agent split) are deferred to Stage 5 polish — see `app/lib/agent/mayor.ts`'s `MAYOR_SYSTEM` prompt for current capabilities.
+Two-tier multi-agent on Claude Managed Agents: **Mayor** (coordinator) + **Zone** sub-agents (specialists), both on `claude-sonnet-4-6`.
 
-- **Design insight:** LLMs can't reliably emit clean 50×50 ASCII grids, but they read them well. So ASCII is LLM *input* (via `cityToAscii`), tool calls are LLM *output*. All tool calls are validated at the call site — `placeProperty` / `placeTileRect` throw on overlap + OOB with structured coordinates, which the Mayor reads and retries.
-- **Custom-tool pattern:** our tools (`place_property`, `place_tile_rect`, `finish`) are declared on the agent (no container execution). Mayor emits `agent.custom_tool_use` → our server runs `applyToolCall` → sends `user.custom_tool_result`. See §Mayor Agent below.
-- **Model:** `claude-sonnet-4-6` for dev iteration. Flip `MAYOR_MODEL` in `mayor.ts` to `claude-opus-4-7` for demo day — one-line change.
+- **Design insight:** LLMs can't reliably emit clean 50×50 ASCII grids, but they're great at structured tool calls. ASCII is dev-only input/output; agents talk to the world via tool calls validated at the call site — `placeProperty` / `placeTileRect` throw on overlap + OOB with structured coordinates that the Mayor (or Zone) reads and retries.
+- **Custom-tool pattern:** all our tools are declared on the agent configs (no container execution). Agent emits `agent.custom_tool_use` → our server runs `applyToolCall` (with bbox enforcement for Zones) → sends `user.custom_tool_result`. See §Mayor Agent below.
+- **Mayor's job (whole-city builds):** lay road + sidewalk grid → partition the grid into 4–8 non-overlapping zones → call `delegate_zones` ONCE with bbox + free-text instructions per zone → optionally place a few signature buildings directly → `finish`. The Mayor does NOT fill in zones itself; that's the Zone agents' job.
+- **Mayor's job (small edits / partial builds):** place buildings directly with the placement tools, no delegation. Configurable in `MAYOR_SYSTEM`.
+- **Zone's job:** receive bbox + Mayor's instructions, place buildings inside the bbox, call `finish` when done. Hard bbox enforcement on every tool call (rejects placements outside the assigned region with structured errors so the Zone self-corrects). Zones run in parallel via `Promise.allSettled` — bboxes don't intersect (validated server-side), so concurrent mutation of the shared `City` is safe.
+- **Model swap:** `MAYOR_MODEL` in `mayor.ts` and `ZONE_MODEL` in `zone.ts` are top-of-file constants. Flip both to `claude-opus-4-7` for demo day — two-line change.
 
 ## Build Stages
 1. **Data schema** ✅ — `app/lib/all_types.tsx`
 2. **Pixel art + rendering system** ✅ — Pixi.js isometric renderer with pan/zoom, grid overlay toggle
 3. **Mayor agent via Managed Agents** ✅ — see §Mayor Agent
 4. **Connect backend to frontend** ✅ — SSE live build, Build button + Pause + Redirect UI in `CityRenderer.tsx`
-5. **Polish** — prompt tuning, multi-agent split (Mayor → Zone / Infra), `pdf`/`docx` skill for final report, `web_search` preamble, `code_execution` for sim stats, memory stores for cross-playthrough learning
-6. **7-day citizen simulation + feedback loop** — needs decay, pathfinding, citizens generate feedback → Mayor report
+5. **Batch tools** ✅ — `place_properties` / `place_tile_rects` array variants. One Mayor turn lays the entire road grid; one Mayor turn delegates all zones.
+6. **Multi-agent split (Mayor + parallel Zone agents)** ✅ — `delegate_zones` Mayor tool + `app/lib/agent/zone.ts`. Hard bbox enforcement, intersection-checked, runs zones via `Promise.allSettled`.
+7. **Remaining polish (deferred)** — `pdf`/`docx` skill for the post-sim report, `web_search` preamble, `code_execution` for sim stats, memory stores for cross-playthrough learning, stream reconnect (MA Pattern 1), per-zone interrupt UI.
+8. **7-day citizen simulation + feedback loop** — needs decay, pathfinding, citizens generate feedback → Mayor report
 
 ## Rendering System (Stage 2 — complete)
 
@@ -220,40 +226,77 @@ Helpers (all in `all_types.tsx`):
 - **`cityToAscii(city) → { grid, legend }`** — `grid` overlays nature and properties onto a copy of `tile_grid` (properties stamp their char across their whole footprint so the LLM sees size/shape), joined with newlines. `legend` is the static `ASCII_LEGEND` string. At 50×50 the grid is ~2.5k chars (fits easily); at 500×500 it's 250k and needs a viewport or block-level summary.
 - **`asciiToCity(ascii, opts?) → City`** — inverse parser, used as a dev/test utility (not wired into the agent pipeline). Strict: throws with `(x, y)` on ragged rows, malformed multi-cell property footprints, overlaps, or unknown chars. `opts.variantStrategy` is `'default'` (deterministic, SSR-safe) or `'random'` (client-only) for picking variant images.
 
-## Mayor Agent (`app/lib/agent/`)
+## Mayor + Zone Agents (`app/lib/agent/`)
 
-### File layout
-- **`tools.ts`** — `ToolCall` discriminated union (`place_property` | `place_tile_rect` | `finish`), per-tool input shapes matching our schema, `applyToolCall(city, call) → ToolResult` dispatcher that wraps the throwing placement helpers into `{ ok: true }` / `{ ok: false, error }`, and `TOOL_SCHEMAS` — the JSON Schema list passed directly to `agents.create({ tools })`.
-- **`mayor.ts`** — Managed Agents plumbing:
-  - `MAYOR_MODEL` constant (top of file) — flip to `claude-opus-4-7` for demo day.
-  - `ensureMayor()` — create-or-reuse pattern for the agent + environment. Reads `MAYOR_AGENT_ID` / `MAYOR_ENV_ID` from env; if missing, creates them and logs the IDs to add to `.env.local`. Avoids the #1 MA anti-pattern (new agent per request).
-  - `createMayorSession(goal)` — `sessions.create()` with agent + env, stashes `{ city: initCity(50), pendingGoal, interrupted: false }` in a module-level `sessions` Map.
-  - `runMayorLoop(sessionId, onEvent)` — stream-first ordering: opens `events.stream()`, then sends the pending goal. For each `agent.custom_tool_use` event: parse → apply via `applyToolCall` → `events.send({user.custom_tool_result, is_error})` back. Emits `tool_applied` synthetic events for the frontend. Terminates on `session.status_terminated`, on `stop_reason: retries_exhausted`, or on `end_turn` when `!state.interrupted`. Turn cap = `MAX_CUSTOM_TOOL_USES = 70`; at the cap we send `user.interrupt` + a nudge asking the Mayor to call `finish`.
-  - `sendInterrupt(sessionId)` — sets `state.interrupted = true`, fires `user.interrupt`. The loop sees the resulting `end_turn` idle and stays alive.
-  - `sendRedirect(sessionId, text)` — clears `state.interrupted`, fires `user.message`. The loop's pending `stream.next()` unblocks with a `session.status_running` event and the Mayor resumes.
-- **`observation.ts`** — `buildObservation(city, errors)` composes `cityToAscii` + counts + prior-turn errors into a text block. Dormant: MA surfaces state via events, not prompt-pumped observations. Kept for a future prompt variant or the Zone/Infra sub-agents.
+### Tool set
+The Mayor has 6 tools; Zones have 5 (no `delegate_zones` — recursion banned).
+
+| Tool | Mayor | Zone | Notes |
+|---|---|---|---|
+| `place_property(property, x, y)` | ✅ | ✅ | One building. Throws on overlap + OOB (Zone also checks bbox). |
+| `place_properties(properties[])` | ✅ | ✅ | Many buildings, one call. Per-item validation, partial-success result. |
+| `place_tile_rect(tile, x1, y1, x2, y2)` | ✅ | ✅ | One ground-tile rectangle. |
+| `place_tile_rects(rects[])` | ✅ | ✅ | Many rects, one call. Mayor lays the entire road grid in one of these. |
+| `delegate_zones(zones[])` | ✅ | ❌ | Mayor-only. `zones: [{bbox, instructions}, ...]`. Validates bboxes server-side then fans out to parallel Zone sessions via `Promise.allSettled`. |
+| `finish(reason)` | ✅ | ✅ | Ends the agent's loop. Mayor's `finish` ends the build; Zone's `finish` ends just that Zone session. |
+
+### `tools.ts`
+- `ToolCall` discriminated union for the singletons (`place_property` | `place_tile_rect` | `finish`). Batch tools and `delegate_zones` are handled inline in `mayor.ts` / `zone.ts` rather than expanding the union.
+- `applyToolCall(city, call) → ToolResult` — wraps the throwing placement helpers into `{ ok: true }` / `{ ok: false, error }`. Used by both Mayor and Zone loops.
+- `TOOL_SCHEMAS` — full JSON-schema list passed to the Mayor's `agents.create({ tools })`. Includes `delegate_zones`.
+- `ZONE_TOOL_SCHEMAS` — `TOOL_SCHEMAS` minus `delegate_zones`. Passed to the Zone's `agents.create({ tools })`. Same identity as `TOOL_SCHEMAS` after filtering — easy to keep in sync.
+
+### `mayor.ts`
+- `MAYOR_MODEL` constant (top of file) — flip to `claude-opus-4-7` for demo day.
+- `MAYOR_SYSTEM` prompt — distinct strategy branches for "build whole city" (lay infra → partition → `delegate_zones` → optional landmarks → `finish`) vs "edit / partial" (place directly, no delegation). Includes guidance on encoding spatial context (road borders, neighbor character) into each zone's `instructions` string since Zones don't see the rest of the city.
+- `ensureMayor()` — create-or-reuse pattern for the Mayor agent + the shared environment. Reads `MAYOR_AGENT_ID` / `MAYOR_ENV_ID` from env; if missing, creates them and logs the IDs to paste into `.env.local`.
+- `createMayorSession(goal)` — `sessions.create()`, stashes `{ city: initCity(50), pendingGoal, interrupted: false, completedZoneBboxes: [] }` in a module-level `sessions` Map.
+- `runMayorLoop(sessionId, onEvent)` — stream-first: opens `events.stream()`, sends the kickoff `user.message` after. For each `agent.custom_tool_use`:
+  - Singletons → `applyToolCall`, send tool_result.
+  - `place_properties` / `place_tile_rects` → unroll into per-item synthetic `tool_applied` events for the frontend, send a single composite `tool_result` text back to MA.
+  - `delegate_zones` → normalize bboxes, validate (in-grid + intra-batch no-intersect + no-intersect with `state.completedZoneBboxes`), fan out to `runZoneBuild()` via `Promise.allSettled`, aggregate summaries, append successful bboxes to `completedZoneBboxes`. Validation failures return a structured error so the Mayor retries without spawning anything.
+  - `finish` → terminate loop.
+  - Turn cap = `MAX_CUSTOM_TOOL_USES = 70`. Counts at the tool-call level, so a `place_properties` with 30 items or a `delegate_zones` with 6 zones each = 1 against the cap.
+- `sendInterrupt(sessionId)` / `sendRedirect(sessionId, text)` — same UI pause/redirect mechanics as before. Note: only the Mayor's session is interruptible; Zones run to their own `finish`.
+- `MayorStreamEvent` is a discriminated union: `anthropic_event` | `tool_applied` (with optional `source: 'mayor' | 'zone'` tag) | `zone_message` | `done`.
+
+### `zone.ts`
+- `ZONE_MODEL` constant (same Sonnet 4.6 by default).
+- `ZONE_SYSTEM` prompt — terse: "you own this bbox, here are your instructions, place buildings, call finish." Explicitly tells the Zone it does NOT see the rest of the city — trust the Mayor's instructions for adjacency context. Hard bbox rule documented inline so the model knows what'll be rejected.
+- `ensureZone()` — create-or-reuse the Zone agent. Reads `ZONE_AGENT_ID` from env; if missing, logs the new ID for `.env.local`. Reuses `MAYOR_ENV_ID` (env passed in by the Mayor's handler — no separate environment).
+- `runZoneBuild(bbox, instructions, city, envId, zoneIndex, onEvent) → ZoneBuildResult`:
+  - `sessions.create()` with the Zone agent.
+  - Kickoff message: just bbox + Mayor's instructions + "place buildings, prefer batch, call finish when done." No full-city ASCII (intentionally — see "Why no ASCII for Zones" below).
+  - Custom-tool loop with bbox validation on every singleton + batch tool call (per-item for batches). Out-of-bbox calls return `(x,y) is outside your zone bbox (x1,y1)-(x2,y2)` so the Zone self-corrects.
+  - Tracks placement counts by type for the summary ("ok: 14 buildings — 8 house, 2 apartment, 1 park, 3 restaurant").
+  - Forwards `tool_applied` and `zone_message` events upstream via `onEvent` so the browser renders Zone placements live through the same SSE pipe.
+- `Bbox = { x1, y1, x2, y2 }` exported type. Bboxes are normalized (min/max corners) by the Mayor before being passed to `runZoneBuild`, so Zone code can assume `x1 ≤ x2, y1 ≤ y2`.
+
+### Why no ASCII for Zones
+Initial design passed `cityToAscii(city)` in the Zone kickoff so the agent could see roads + neighbors. Removed because: (a) it added ~2.5K chars per zone session, mostly never referenced; (b) the Zone's whole point is *focused attention on its bbox*, and dumping the full city dilutes that; (c) the Mayor already sees the full map and can encode any needed spatial context (road borders, neighbor character) directly into each zone's `instructions` string. Cleaner mental model, smaller prompt, better outputs in practice.
 
 ### API routes (`app/app/api/mayor/`)
-- **`POST /api/mayor`** — body `{ goal: string }` → `{ sessionId }`. Validates the body, calls `createMayorSession(goal)`.
-- **`GET /api/mayor/[sessionId]/stream`** — SSE. Opens a `ReadableStream`, runs `runMayorLoop` server-side, forwards each `MayorStreamEvent` as `event: mayor\ndata: <json>\n\n`. Browser narrows by `payload.kind`: `anthropic_event` | `tool_applied` | `done`.
-- **`POST /api/mayor/[sessionId]/interrupt`** — wraps `sendInterrupt`. Returns `{ ok: true }`.
+- **`POST /api/mayor`** — body `{ goal: string }` → `{ sessionId }`. Calls `createMayorSession(goal)`.
+- **`GET /api/mayor/[sessionId]/stream`** — SSE. Opens a `ReadableStream`, runs `runMayorLoop` server-side, forwards each `MayorStreamEvent` as `event: mayor\ndata: <json>\n\n`. Browser narrows by `payload.kind`: `anthropic_event` | `tool_applied` (mayor or zone) | `zone_message` | `done`.
+- **`POST /api/mayor/[sessionId]/interrupt`** — wraps `sendInterrupt` (Mayor only — Zones not interruptible).
 - **`POST /api/mayor/[sessionId]/message`** — body `{ text: string }`. Wraps `sendRedirect`.
 
 All four routes return `{ error: "..." }` with 404/400/500 on unknown sessionId / missing fields / server error.
 
 ### Frontend integration (`components/CityRenderer.tsx`)
-- Mayor control panel (top-left): goal textarea, Build button, status chip (`idle` / `running` / `paused` / `done`), Pause button (while running), Redirect textarea + "Resume with nudge" button (while paused), Mayor's-thoughts scroll panel showing the last 5 `agent.message` texts.
-- Build flow: clears local `cityRef`, POSTs `/api/mayor`, opens `new EventSource(.../stream)`, listens for `event: mayor`, and on each `tool_applied` with `result.ok === true` calls `placeProperty` / `placeTileRect` against the local city, then `scheduleRender()`.
-- Status state machine drives UI from `session.status_*` events (see `handleMayorEvent`).
+- Mayor control panel (top-left): goal textarea, Build button, status chip (`idle` / `running` / `paused` / `done`), Pause button (while running), Redirect textarea + "Resume with nudge" button (while paused), Mayor's-thoughts scroll panel showing recent `agent.message` texts.
+- Build flow: clears local `cityRef`, POSTs `/api/mayor`, opens `new EventSource(.../stream)`, listens for `event: mayor`. On each `tool_applied` with `result.ok === true` (regardless of `source`) calls `placeProperty` / `placeTileRect` against the local city and `scheduleRender()`. Zone events are mechanically identical to Mayor events on the wire — the `source` tag is purely informational.
+- During multi-zone builds, several quadrants fill in concurrently rather than corner-to-corner — clear visual signal that parallel Zone agents are working.
 
 ### Environment variables (`app/.env.local`)
 - `ANTHROPIC_API_KEY` — required.
-- `MAYOR_AGENT_ID`, `MAYOR_ENV_ID` — persist after first boot so subsequent dev-server restarts reuse the same agent/environment instead of creating fresh ones. If missing, `ensureMayor()` creates them and logs the IDs to paste in.
+- `MAYOR_AGENT_ID`, `MAYOR_ENV_ID`, `ZONE_AGENT_ID` — persist after first boot. Missing IDs trigger fresh `agents.create()` / `environments.create()` calls; the new IDs are logged to the dev console for the user to paste into `.env.local`. **Drop the relevant ID(s) and restart whenever the agent's tool list or system prompt changes** (the agent config on Anthropic's side is immutable per version; we don't currently call `agents.update`).
 
-### Known limitations (deferred to Stage 5 polish)
-- **Reconnect mid-stream not supported.** The server-side `runMayorLoop` guards against double-attach with a `running` flag. If the browser disconnects mid-build, the server loop continues to completion but a new page can't re-attach (`"loop already running"`). Fix: MA client Pattern 1 — `events.list()` + dedupe on reconnect. Out of scope for hackathon.
+### Known limitations (deferred polish)
+- **Reconnect mid-stream not supported.** Server-side loop guards against double-attach with a `running` flag. Browser drop mid-build → loop completes server-side but a new page can't re-attach. Fix: MA client Pattern 1 (`events.list()` + dedupe on reconnect).
+- **Zone sessions not interruptible from UI.** Pause button halts the Mayor; Zones already-spawned run to their own `finish`. Zone-level interrupt would need its own UI surface.
 - **Single-user demo assumption.** Module-level `sessions` Map is per-process. Two browser tabs can coexist with different sessions but not multi-tenant.
-- **No persistence across server restarts.** City state lives in memory; dev-server restart wipes active sessions (but the MA session itself persists on Anthropic's side — could reconnect with Pattern 1 once implemented).
+- **Agent config drift.** Changing `MAYOR_SYSTEM`, `ZONE_SYSTEM`, or any tool schema requires deleting the corresponding `*_AGENT_ID` from `.env.local` and restarting. Faster long-term: call `client.beta.agents.update()` on boot.
 
 ## Key Design Notes
 - Citizens have needs that decay over time; buildings satisfy those needs — the city either *works* or *fails*, not just gets built
