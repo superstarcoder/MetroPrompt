@@ -468,6 +468,28 @@ export const placeNature = (city: City, nature: Nature): void => {
   city.all_nature.push(nature);
 };
 
+// Remove the property whose footprint covers `position` (any cell, not just anchor).
+// Returns the removed property, or undefined if none matched.
+export const deletePropertyAt = (city: City, position: Position): Property | undefined => {
+  const idx = city.all_properties.findIndex(p =>
+    position.x >= p.position.x && position.x < p.position.x + p.width &&
+    position.y >= p.position.y && position.y < p.position.y + p.height
+  );
+  if (idx === -1) return undefined;
+  const [removed] = city.all_properties.splice(idx, 1);
+  return removed;
+};
+
+// Remove the nature item at exactly `position` (1x1). Returns it if found.
+export const deleteNatureAt = (city: City, position: Position): Nature | undefined => {
+  const idx = city.all_nature.findIndex(n =>
+    n.position.x === position.x && n.position.y === position.y
+  );
+  if (idx === -1) return undefined;
+  const [removed] = city.all_nature.splice(idx, 1);
+  return removed;
+};
+
 export const getTileAt = (city: City, position: Position): TileName => {
   return CODE_TO_TILE[city.tile_grid[position.y][position.x]];
 };

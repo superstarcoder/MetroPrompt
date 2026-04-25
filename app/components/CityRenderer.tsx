@@ -18,6 +18,8 @@ import {
   placeProperty,
   placeTileRect,
   placeNature,
+  deletePropertyAt,
+  deleteNatureAt,
 } from '@/lib/all_types';
 import type { City, Nature, NatureName, Property, PropertyName, TileName } from '@/lib/all_types';
 
@@ -136,6 +138,13 @@ function toolStyle(name: string): ToolStyle {
     case 'place_nature':
     case 'place_natures':
       return { glyph: '✿', label: 'NATURE', textCls: 'text-emerald-300', borderCls: 'border-emerald-400/70', bgCls: 'bg-emerald-500/15', dotCls: 'bg-emerald-400' };
+    case 'delete_property':
+    case 'delete_properties':
+    case 'delete_tile_rect':
+    case 'delete_tile_rects':
+    case 'delete_nature':
+    case 'delete_natures':
+      return { glyph: '✕', label: 'REMOVE', textCls: 'text-rose-300', borderCls: 'border-rose-400/70', bgCls: 'bg-rose-500/15', dotCls: 'bg-rose-400' };
     case 'finish':
       return { glyph: '✓', label: 'FINISH', textCls: 'text-sky-300', borderCls: 'border-sky-400/70', bgCls: 'bg-sky-500/15', dotCls: 'bg-sky-400' };
     default:
@@ -152,6 +161,11 @@ function formatToolInput(name: string, input: Record<string, unknown>): string {
       return `${String(i.tile)} (${i.x1},${i.y1})→(${i.x2},${i.y2})`;
     case 'place_nature':
       return `${String(i.nature)} @ (${i.x},${i.y})`;
+    case 'delete_property':
+    case 'delete_nature':
+      return `@ (${i.x},${i.y})`;
+    case 'delete_tile_rect':
+      return `(${i.x1},${i.y1})→(${i.x2},${i.y2}) → grass`;
     case 'finish':
       return String(i.reason ?? '');
     default:
@@ -185,6 +199,7 @@ export default function CityRenderer() {
   const [goal, setGoal] = useState(
     'Build a small mixed-use city: a central road grid, a park, a hospital, residential blocks, and a small commercial strip. Then call finish.'
   );
+  const [followupText, setFollowupText] = useState('');
   const [redirectText, setRedirectText] = useState('');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const esRef = useRef<EventSource | null>(null);
@@ -423,6 +438,19 @@ export default function CityRenderer() {
         } catch {
           // same as above
         }
+      } else if (payload.name === 'delete_property') {
+        const input = payload.input as { x: number; y: number };
+        deletePropertyAt(city, { x: input.x, y: input.y });
+      } else if (payload.name === 'delete_nature') {
+        const input = payload.input as { x: number; y: number };
+        deleteNatureAt(city, { x: input.x, y: input.y });
+      } else if (payload.name === 'delete_tile_rect') {
+        const input = payload.input as { x1: number; y1: number; x2: number; y2: number };
+        try {
+          placeTileRect(city, input.x1, input.y1, input.x2, input.y2, 'grass');
+        } catch {
+          // server already validated
+        }
       }
       // 'finish' → no local mutation; 'done' event will flip status
       scheduleRender();
@@ -461,6 +489,10 @@ export default function CityRenderer() {
 
     if (payload.kind === 'done') {
       setStatus('done');
+      // Close the EventSource so the browser doesn't auto-reconnect and spawn
+      // a zombie runMayorLoop on the server. A follow-up will open a new one.
+      esRef.current?.close();
+      esRef.current = null;
       return;
     }
   }, [scheduleRender, pushMessage, pushToolApplied]);
@@ -502,6 +534,35 @@ export default function CityRenderer() {
       setStatus('idle');
     }
   }, [goal, handleMayorEvent, scheduleRender]);
+
+  const onFollowup = useCallback(async () => {
+    if (!sessionId || !followupText.trim()) return;
+    const goalText = followupText.trim();
+    setFollowupText('');
+    setStatus('running');
+    try {
+      const resp = await fetch(`/api/mayor/${sessionId}/followup`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ goal: goalText }),
+      });
+      const body = await resp.json();
+      if (!resp.ok) {
+        console.error('[followup]', body);
+        setStatus('done');
+        return;
+      }
+      // Reopen stream — keeps the city + feed intact.
+      esRef.current?.close();
+      const es = new EventSource(`/api/mayor/${sessionId}/stream`);
+      es.addEventListener('mayor', handleMayorEvent as (e: Event) => void);
+      es.onerror = () => { /* EventSource auto-reconnects; ignore */ };
+      esRef.current = es;
+    } catch (e) {
+      console.error('[followup]', e);
+      setStatus('done');
+    }
+  }, [sessionId, followupText, handleMayorEvent]);
 
   const onPause = useCallback(async () => {
     if (!sessionId) return;
@@ -814,6 +875,36 @@ export default function CityRenderer() {
                 style={{ boxShadow: '3px 3px 0 0 rgba(0,0,0,0.85)' }}
               >
                 ▶ Resume with nudge
+              </button>
+            </>
+          ) : status === 'done' && sessionId ? (
+            <>
+              <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-sky-300">
+                <span className="inline-block w-2 h-2 bg-sky-400" />
+                Build complete — send a follow-up to edit the city
+              </div>
+              <textarea
+                value={followupText}
+                onChange={(e) => setFollowupText(e.target.value)}
+                rows={3}
+                className="w-full p-2 bg-black/60 text-white text-xs border-2 border-white/40 focus:border-fuchsia-400 outline-none resize-none"
+                placeholder="e.g. remove the hospital and put a park there, add more trees along the main road…"
+              />
+              <button
+                onClick={onFollowup}
+                disabled={!followupText.trim()}
+                className="w-full py-2 bg-fuchsia-400 hover:bg-fuchsia-300 disabled:bg-white/10 disabled:text-white/40 text-black text-xs font-bold uppercase tracking-wider border-2 border-white/90 transition-colors"
+                style={{ boxShadow: '3px 3px 0 0 rgba(0,0,0,0.85)' }}
+              >
+                ✎ Send follow-up
+              </button>
+              <button
+                onClick={onBuild}
+                disabled={!goal.trim()}
+                className="w-full py-1.5 bg-transparent hover:bg-white/5 disabled:opacity-40 text-white/60 hover:text-white text-[10px] uppercase tracking-wider border border-white/30"
+                title="Discard the current city and start a brand-new build with the goal above"
+              >
+                ↺ start over with new goal
               </button>
             </>
           ) : (

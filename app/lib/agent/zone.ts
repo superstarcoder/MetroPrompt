@@ -7,8 +7,16 @@ import type { City, NatureName, PropertyName, TileName } from '../all_types';
 // ============================================================
 // MODEL + AGENT CONFIG
 // ============================================================
-
-export const ZONE_MODEL = 'claude-sonnet-4-6';
+// Haiku 4.5 for Zones: their job ("place buildings in this bbox per the
+// Mayor's brief") is a constrained, low-ambiguity task that doesn't reward
+// the heavy extended thinking Sonnet 4.6 does by default. Sonnet was burning
+// 20k+ output tokens deliberating on simple zone fills, occasionally hitting
+// internal limits mid-tool-call and stranding the session in `requires_action`.
+// Haiku is faster, cheaper, doesn't over-think this kind of task, and the
+// quality is plenty for "drop 15 buildings in a 10x10 bbox."
+// The Mayor stays on Sonnet 4.6 — partition + delegation strategy benefits
+// from the deeper reasoning.
+export const ZONE_MODEL = 'claude-haiku-4-5';
 const ZONE_AGENT_NAME = 'MetroPrompt Zone';
 const MAX_ZONE_TOOL_USES = 70;
 
@@ -209,7 +217,17 @@ export async function runZoneBuild(
   let toolUseCount = 0;
   let finished = false;
 
+  // Tool-use ledger. Every `agent.custom_tool_use` we receive is added here;
+  // every `sendResult` removes its entry. Anything still in the set when the
+  // loop exits is an unanswered tool_use that would otherwise strand the
+  // session in `requires_action` forever — the finally below drains them with
+  // a generic error response. sendResult is also a no-op for IDs not in the
+  // set, so we can't accidentally double-respond.
+  const pending = new Set<string>();
+
   const sendResult = async (useId: string, text: string, isError: boolean) => {
+    if (!pending.has(useId)) return;
+    pending.delete(useId);
     await c.beta.sessions.events.send(sessionId, {
       events: [
         {
@@ -263,6 +281,7 @@ export async function runZoneBuild(
     });
   };
 
+  let errored: Error | null = null;
   try {
     for await (const event of stream) {
       if (event.type === 'agent.message') {
@@ -275,6 +294,7 @@ export async function runZoneBuild(
       }
 
       if (event.type === 'agent.custom_tool_use') {
+        pending.add(event.id);
         toolUseCount++;
 
         // BATCH: place_properties
@@ -418,10 +438,36 @@ export async function runZoneBuild(
       }
     }
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
+    errored = e instanceof Error ? e : new Error(String(e));
+  } finally {
+    // Drain any unanswered tool_use_ids. If a handler threw between receiving
+    // the tool_use and sending its result, the session would otherwise sit in
+    // `requires_action` forever waiting for a reply that never comes.
+    for (const id of Array.from(pending)) {
+      try {
+        await c.beta.sessions.events.send(sessionId, {
+          events: [
+            {
+              type: 'user.custom_tool_result',
+              custom_tool_use_id: id,
+              content: [{ type: 'text', text: 'internal error: tool handler did not return a result' }],
+              is_error: true,
+            },
+          ],
+        });
+        console.warn(`[zone ${zoneIndex}] drained unanswered tool_use_id ${id}`);
+      } catch {
+        // Best-effort cleanup — if even this send fails, there's nothing more
+        // we can do; let the session time out on Anthropic's side.
+      }
+    }
+    pending.clear();
+  }
+
+  if (errored) {
     return {
       ok: false,
-      summary: `zone ${zoneIndex} errored: ${msg}`,
+      summary: `zone ${zoneIndex} errored: ${errored.message}`,
       bbox,
       counts,
     };

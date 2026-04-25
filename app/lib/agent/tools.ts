@@ -9,6 +9,8 @@ import {
   placeNature,
   getPropertyAt,
   getTileAt,
+  deletePropertyAt,
+  deleteNatureAt,
 } from '../all_types';
 import type { City, NatureName, PropertyName, TileName } from '../all_types';
 
@@ -31,6 +33,9 @@ export type ToolCall =
   | { name: 'place_property'; input: { property: PropertyName; x: number; y: number } }
   | { name: 'place_tile_rect'; input: { tile: TileName; x1: number; y1: number; x2: number; y2: number } }
   | { name: 'place_nature'; input: { nature: NatureName; x: number; y: number } }
+  | { name: 'delete_property'; input: { x: number; y: number } }
+  | { name: 'delete_tile_rect'; input: { x1: number; y1: number; x2: number; y2: number } }
+  | { name: 'delete_nature'; input: { x: number; y: number } }
   | { name: 'finish'; input: { reason: string } };
 
 export type ToolResult =
@@ -140,6 +145,59 @@ function handlePlaceNature(
   return { ok: true };
 }
 
+// Delete the property whose footprint covers (x,y). Any cell of the footprint
+// works — the agent doesn't need to remember the anchor.
+function handleDeleteProperty(
+  city: City,
+  args: { x: number; y: number },
+): ToolResult {
+  const h = city.tile_grid.length;
+  const w = city.tile_grid[0]?.length ?? 0;
+  if (args.x < 0 || args.y < 0 || args.x >= w || args.y >= h) {
+    return {
+      ok: false,
+      error: `delete_property: (${args.x},${args.y}) is out of bounds (grid ${w}x${h})`,
+    };
+  }
+  const removed = deletePropertyAt(city, { x: args.x, y: args.y });
+  if (!removed) {
+    return {
+      ok: false,
+      error: `delete_property: no building covers (${args.x},${args.y})`,
+    };
+  }
+  return { ok: true };
+}
+
+// Delete a rectangle of ground tiles by resetting them to grass. Same OOB
+// behavior as placeTileRect.
+function handleDeleteTileRect(
+  city: City,
+  args: { x1: number; y1: number; x2: number; y2: number },
+): ToolResult {
+  try {
+    placeTileRect(city, args.x1, args.y1, args.x2, args.y2, 'grass');
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+// Delete the nature item at exactly (x,y).
+function handleDeleteNature(
+  city: City,
+  args: { x: number; y: number },
+): ToolResult {
+  const removed = deleteNatureAt(city, { x: args.x, y: args.y });
+  if (!removed) {
+    return {
+      ok: false,
+      error: `delete_nature: no nature item at (${args.x},${args.y})`,
+    };
+  }
+  return { ok: true };
+}
+
 function handleFinish(_city: City, _args: { reason: string }): ToolResult {
   return { ok: true, done: true };
 }
@@ -150,10 +208,13 @@ function handleFinish(_city: City, _args: { reason: string }): ToolResult {
 
 export function applyToolCall(city: City, call: ToolCall): ToolResult {
   switch (call.name) {
-    case 'place_property':  return handlePlaceProperty(city, call.input);
-    case 'place_tile_rect': return handlePlaceTileRect(city, call.input);
-    case 'place_nature':    return handlePlaceNature(city, call.input);
-    case 'finish':          return handleFinish(city, call.input);
+    case 'place_property':   return handlePlaceProperty(city, call.input);
+    case 'place_tile_rect':  return handlePlaceTileRect(city, call.input);
+    case 'place_nature':     return handlePlaceNature(city, call.input);
+    case 'delete_property':  return handleDeleteProperty(city, call.input);
+    case 'delete_tile_rect': return handleDeleteTileRect(city, call.input);
+    case 'delete_nature':    return handleDeleteNature(city, call.input);
+    case 'finish':           return handleFinish(city, call.input);
   }
 }
 
@@ -178,6 +239,12 @@ type ToolSchema = {
     | 'place_tile_rects'
     | 'place_nature'
     | 'place_natures'
+    | 'delete_property'
+    | 'delete_properties'
+    | 'delete_tile_rect'
+    | 'delete_tile_rects'
+    | 'delete_nature'
+    | 'delete_natures'
     | 'delegate_zones'
     | 'finish';
   description: string;
@@ -321,6 +388,124 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'delete_property',
+    description:
+      'Remove an existing building. Provide ANY cell of the building\'s footprint — you do NOT need to remember the anchor. ' +
+      'For removing two or more buildings at once, prefer delete_properties (the batch variant). ' +
+      'Fails if no building covers the given cell or if the cell is out of bounds. ' +
+      'Use during follow-up edits to clear space before re-placing.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        x: { type: 'integer', minimum: 0 },
+        y: { type: 'integer', minimum: 0 },
+      },
+      required: ['x', 'y'],
+    },
+  },
+  {
+    name: 'delete_properties',
+    description:
+      'Remove MANY buildings in one tool call. PREFERRED when removing more than one — collapses N delete_property calls into one. ' +
+      'Each (x,y) may be ANY cell of the target building\'s footprint. Per-item validation, partial success reported back.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        positions: {
+          type: 'array',
+          minItems: 1,
+          items: {
+            type: 'object',
+            properties: {
+              x: { type: 'integer', minimum: 0 },
+              y: { type: 'integer', minimum: 0 },
+            },
+            required: ['x', 'y'],
+          },
+        },
+      },
+      required: ['positions'],
+    },
+  },
+  {
+    name: 'delete_tile_rect',
+    description:
+      'Reset a rectangle of ground tiles back to grass (corners inclusive). ' +
+      'Use to remove roads, sidewalks, crosswalks, intersections, or pavement. For multiple rectangles, prefer delete_tile_rects. ' +
+      'A single cell is x1=x2, y1=y2. Does NOT touch buildings or nature on top — delete those separately if needed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        x1: { type: 'integer', minimum: 0 },
+        y1: { type: 'integer', minimum: 0 },
+        x2: { type: 'integer', minimum: 0 },
+        y2: { type: 'integer', minimum: 0 },
+      },
+      required: ['x1', 'y1', 'x2', 'y2'],
+    },
+  },
+  {
+    name: 'delete_tile_rects',
+    description:
+      'Reset MANY tile rectangles back to grass in one tool call. PREFERRED when removing a road network or several bands at once.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        rects: {
+          type: 'array',
+          minItems: 1,
+          items: {
+            type: 'object',
+            properties: {
+              x1: { type: 'integer', minimum: 0 },
+              y1: { type: 'integer', minimum: 0 },
+              x2: { type: 'integer', minimum: 0 },
+              y2: { type: 'integer', minimum: 0 },
+            },
+            required: ['x1', 'y1', 'x2', 'y2'],
+          },
+        },
+      },
+      required: ['rects'],
+    },
+  },
+  {
+    name: 'delete_nature',
+    description:
+      'Remove a 1x1 nature item (tree / flower_patch / bush) at exactly (x, y). For multiple, prefer delete_natures. Fails if no nature item is at that cell.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        x: { type: 'integer', minimum: 0 },
+        y: { type: 'integer', minimum: 0 },
+      },
+      required: ['x', 'y'],
+    },
+  },
+  {
+    name: 'delete_natures',
+    description:
+      'Remove MANY nature items in one tool call. Each (x,y) must exactly match a nature anchor; per-item validation, partial success reported back.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        positions: {
+          type: 'array',
+          minItems: 1,
+          items: {
+            type: 'object',
+            properties: {
+              x: { type: 'integer', minimum: 0 },
+              y: { type: 'integer', minimum: 0 },
+            },
+            required: ['x', 'y'],
+          },
+        },
+      },
+      required: ['positions'],
+    },
+  },
+  {
     name: 'delegate_zones',
     description:
       'Hand off multiple regions of the grid to Zone sub-agents that each fill in one bbox. ' +
@@ -373,7 +558,18 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
 ];
 
 // Zone agents get placement tools + finish only. Delegate_zones is Mayor-only
-// (no recursive sub-delegation — keeps the system bounded).
+// (no recursive sub-delegation — keeps the system bounded). Delete tools are
+// Mayor-only too — Zones build into a fresh interior; surgical edits are the
+// Mayor's job during follow-up prompts.
+const ZONE_EXCLUDED: ReadonlySet<ToolSchema['name']> = new Set([
+  'delegate_zones',
+  'delete_property',
+  'delete_properties',
+  'delete_tile_rect',
+  'delete_tile_rects',
+  'delete_nature',
+  'delete_natures',
+]);
 export const ZONE_TOOL_SCHEMAS: ToolSchema[] = TOOL_SCHEMAS.filter(
-  s => s.name !== 'delegate_zones',
+  s => !ZONE_EXCLUDED.has(s.name),
 );

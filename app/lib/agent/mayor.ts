@@ -76,7 +76,10 @@ TOOLS
   * 2×2 footprint: house, restaurant
 - place_tile_rect(tile, x1, y1, x2, y2): fill a rectangle of ground tiles (corners inclusive). Tile names: grass, pavement, road_one_way, road_two_way, road_intersection, crosswalk, sidewalk. A single cell is x1=x2, y1=y2. Use this for roads and sidewalks — ONE call lays a whole band.
 - place_nature(nature, x, y) / place_natures([...]): drop 1×1 decorative greenery (tree, flower_patch, bush) on free GRASS cells only. Anything not on grass — roads, sidewalks, crosswalks, intersections, pavement, or building footprints — is rejected. Use it to line streets (place trees on the grass strip BESIDE the sidewalk, never on the sidewalk itself), soften zone edges, decorate parks, and fill awkward gaps. Prefer the batch variant.
-- finish(reason): signal the city is complete. Call exactly ONCE when you're satisfied.
+- delete_property(x, y) / delete_properties([{x,y}, ...]): remove an existing building. (x,y) can be ANY cell of the footprint — you do NOT need the anchor. Fails if no building covers that cell.
+- delete_tile_rect(x1,y1,x2,y2) / delete_tile_rects([...]): reset a rectangle of ground tiles back to grass. Use to remove roads, sidewalks, crosswalks, pavement. Buildings/nature on top are NOT removed — delete those separately.
+- delete_nature(x, y) / delete_natures([{x,y}, ...]): remove a 1×1 nature item at exactly that cell.
+- finish(reason): signal you are done with the CURRENT prompt. Call exactly ONCE per prompt. The session stays alive — the user may send a follow-up prompt asking for edits.
 
 RULES (enforced — violations return structured errors with coordinates)
 1. Building footprints cannot overlap any existing building. Edge-to-edge contact is fine.
@@ -116,6 +119,14 @@ STRATEGY (if asked to build a specific building or amenity or small cluster or n
 1. Sketch mentally before placing anything.
 2. Understand what has been done and what can be built around it — the city evolves, so adapt to the current state.
 3. Feel free to use your singleton tools (place_property, place_tile_rect) or their batch variants for smaller, more targeted improvements
+
+STRATEGY (if asked to EDIT or REMOVE existing things — happens on follow-up prompts)
+The session persists across prompts: after you call finish, the user can send a new instruction asking for changes. You retain full memory of what you built. For edits:
+1. Use the delete_* tools to remove buildings, ground tiles, or nature items first. delete_property accepts ANY cell of the footprint, so you don't need to remember exact anchors — pick any cell that's clearly inside the building you want gone.
+2. After clearing space, use the place_* tools to add the requested replacements. Remember the grass-only rule still applies — if you delete a building but the ground underneath is still road/sidewalk, you must delete_tile_rect that area to grass before placing a new building there.
+3. For pure additions (e.g. "add a few more trees", "put a hospital in the southeast"), skip the delete step and just use place_* / place_natures.
+4. Do NOT call delegate_zones for follow-up edits — use the singleton or batch place/delete tools directly. delegate_zones is for fresh whole-city builds only; the server will reject any zone that overlaps territory previously delegated in this session.
+5. Call finish(reason) when you're done with the requested edit. The session stays alive for the next follow-up.
 
 Be efficient. The city speaks for itself — no long explanations needed.`;
 
@@ -230,6 +241,17 @@ export async function sendInterrupt(sessionId: string): Promise<void> {
   });
 }
 
+// Follow-up prompt after a previous build's `finish`. The session is reused —
+// no new agent boot, no fresh ASCII context. The browser then opens a new
+// EventSource on /stream which picks up `pendingGoal` and runs the loop again.
+export async function setFollowupGoal(sessionId: string, goal: string): Promise<void> {
+  const s = sessions.get(sessionId);
+  if (!s) throw new Error(`[mayor] unknown sessionId: ${sessionId}`);
+  if (s.running) throw new Error(`[mayor] cannot queue follow-up while loop is running`);
+  s.pendingGoal = goal;
+  s.interrupted = false;
+}
+
 export async function sendRedirect(sessionId: string, text: string): Promise<void> {
   const s = sessions.get(sessionId);
   if (s) s.interrupted = false;
@@ -276,6 +298,9 @@ function parseToolCall(
     name === 'place_property' ||
     name === 'place_tile_rect' ||
     name === 'place_nature' ||
+    name === 'delete_property' ||
+    name === 'delete_tile_rect' ||
+    name === 'delete_nature' ||
     name === 'finish'
   ) {
     return { name, input: input as never } as ToolCall;
@@ -286,6 +311,8 @@ function parseToolCall(
 type PlacePropertyItem = { property: PropertyName; x: number; y: number };
 type PlaceTileRectItem = { tile: TileName; x1: number; y1: number; x2: number; y2: number };
 type PlaceNatureItem = { nature: NatureName; x: number; y: number };
+type DeletePositionItem = { x: number; y: number };
+type DeleteTileRectItem = { x1: number; y1: number; x2: number; y2: number };
 type DelegateZonesItem = { bbox: Bbox; instructions: string };
 
 function formatProperty(item: PlacePropertyItem): string {
@@ -296,6 +323,12 @@ function formatTileRect(item: PlaceTileRectItem): string {
 }
 function formatNature(item: PlaceNatureItem): string {
   return `place_nature(${item.nature}, ${item.x}, ${item.y})`;
+}
+function formatDeletePos(kind: 'property' | 'nature', item: DeletePositionItem): string {
+  return `delete_${kind}(${item.x}, ${item.y})`;
+}
+function formatDeleteTileRect(item: DeleteTileRectItem): string {
+  return `delete_tile_rect(${item.x1},${item.y1}–${item.x2},${item.y2})`;
 }
 function formatBbox(b: Bbox): string {
   return `(${b.x1},${b.y1})–(${b.x2},${b.y2})`;
@@ -326,31 +359,49 @@ export async function runMayorLoop(
   const state = sessions.get(sessionId);
   if (!state) throw new Error(`[mayor] unknown sessionId: ${sessionId}`);
   if (state.running) throw new Error(`[mayor] loop already running for ${sessionId}`);
+
+  // Guard against EventSource auto-reconnects after `finish`. If the browser
+  // reopens /stream with no queued goal (i.e. not a deliberate follow-up via
+  // setFollowupGoal), there's nothing for the loop to do — bail immediately
+  // instead of sitting on the Anthropic stream and holding `running = true`.
+  if (!state.pendingGoal) {
+    onEvent({ kind: 'done', reason: 'no pending goal — nothing to do' });
+    return;
+  }
+
   state.running = true;
 
   const c = client();
   // STREAM-FIRST: open the stream before sending the kickoff, so we don't miss early events.
   const stream = await c.beta.sessions.events.stream(sessionId);
 
-  if (state.pendingGoal) {
-    const goal = state.pendingGoal;
-    state.pendingGoal = undefined;
-    await c.beta.sessions.events.send(sessionId, {
-      events: [{ type: 'user.message', content: [{ type: 'text', text: goal }] }],
-    });
-  }
+  const goal = state.pendingGoal;
+  state.pendingGoal = undefined;
+  await c.beta.sessions.events.send(sessionId, {
+    events: [{ type: 'user.message', content: [{ type: 'text', text: goal }] }],
+  });
 
   let customToolUseCount = 0;
+
+  // Tool-use ledger — every received `agent.custom_tool_use` is added; every
+  // `sendResult` removes its entry. The finally below drains anything left
+  // (e.g. handler threw before sending a result) so the session can never sit
+  // in `requires_action` forever waiting on a reply that never comes.
+  const pending = new Set<string>();
 
   try {
     for await (const event of stream) {
       onEvent({ kind: 'anthropic_event', event });
 
       if (event.type === 'agent.custom_tool_use') {
+        pending.add(event.id);
         customToolUseCount++;
 
-        // Helper: send a single text result back to MA.
+        // Helper: send a single text result back to MA. No-op if this id is
+        // not in the pending set (already responded, or unknown id).
         const sendResult = async (text: string, isError: boolean) => {
+          if (!pending.has(event.id)) return;
+          pending.delete(event.id);
           await c.beta.sessions.events.send(sessionId, {
             events: [
               {
@@ -479,6 +530,78 @@ export async function runMayorLoop(
             failures.length === 0
               ? `ok: all ${items.length} placed`
               : `partial: ${okCount}/${items.length} placed\nfailed:\n${failures.join('\n')}`;
+          await sendResult(text, failures.length > 0);
+          await sendCapNudgeIfHit();
+          continue;
+        }
+
+        // ---- BATCH: delete_properties / delete_tile_rects / delete_natures ----
+        if (
+          event.name === 'delete_properties' ||
+          event.name === 'delete_natures'
+        ) {
+          const items =
+            (event.input as { positions?: DeletePositionItem[] }).positions ?? [];
+          const singletonName =
+            event.name === 'delete_properties' ? 'delete_property' : 'delete_nature';
+          const kind: 'property' | 'nature' =
+            event.name === 'delete_properties' ? 'property' : 'nature';
+          let okCount = 0;
+          const failures: string[] = [];
+
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const result = applyToolCall(state.city, {
+              name: singletonName,
+              input: item,
+            } as ToolCall);
+            onEvent({
+              kind: 'tool_applied',
+              tool_use_id: `${event.id}#${i}`,
+              name: singletonName,
+              input: item as unknown as Record<string, unknown>,
+              result,
+            });
+            if (result.ok) okCount++;
+            else failures.push(`[${i}] ${formatDeletePos(kind, item)}: ${result.error}`);
+          }
+
+          const text =
+            failures.length === 0
+              ? `ok: all ${items.length} removed`
+              : `partial: ${okCount}/${items.length} removed\nfailed:\n${failures.join('\n')}`;
+          await sendResult(text, failures.length > 0);
+          await sendCapNudgeIfHit();
+          continue;
+        }
+
+        if (event.name === 'delete_tile_rects') {
+          const items =
+            (event.input as { rects?: DeleteTileRectItem[] }).rects ?? [];
+          let okCount = 0;
+          const failures: string[] = [];
+
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const result = applyToolCall(state.city, {
+              name: 'delete_tile_rect',
+              input: item,
+            });
+            onEvent({
+              kind: 'tool_applied',
+              tool_use_id: `${event.id}#${i}`,
+              name: 'delete_tile_rect',
+              input: item as unknown as Record<string, unknown>,
+              result,
+            });
+            if (result.ok) okCount++;
+            else failures.push(`[${i}] ${formatDeleteTileRect(item)}: ${result.error}`);
+          }
+
+          const text =
+            failures.length === 0
+              ? `ok: all ${items.length} cleared to grass`
+              : `partial: ${okCount}/${items.length} cleared\nfailed:\n${failures.join('\n')}`;
           await sendResult(text, failures.length > 0);
           await sendCapNudgeIfHit();
           continue;
@@ -634,7 +757,7 @@ export async function runMayorLoop(
           ? applyToolCall(state.city, call)
           : {
               ok: false,
-              error: `unknown tool '${event.name}'. Valid: place_property, place_properties, place_tile_rect, place_tile_rects, place_nature, place_natures, delegate_zones, finish`,
+              error: `unknown tool '${event.name}'. Valid: place_property, place_properties, place_tile_rect, place_tile_rects, place_nature, place_natures, delete_property, delete_properties, delete_tile_rect, delete_tile_rects, delete_nature, delete_natures, delegate_zones, finish`,
             };
 
         onEvent({
@@ -679,6 +802,27 @@ export async function runMayorLoop(
       }
     }
   } finally {
+    // Drain any unanswered tool_use_ids before releasing the loop. If a handler
+    // threw between receiving the tool_use and sending its result, this is the
+    // only thing standing between us and a session stuck in `requires_action`.
+    for (const id of Array.from(pending)) {
+      try {
+        await c.beta.sessions.events.send(sessionId, {
+          events: [
+            {
+              type: 'user.custom_tool_result',
+              custom_tool_use_id: id,
+              content: [{ type: 'text', text: 'internal error: tool handler did not return a result' }],
+              is_error: true,
+            },
+          ],
+        });
+        console.warn(`[mayor] drained unanswered tool_use_id ${id}`);
+      } catch {
+        // best-effort cleanup
+      }
+    }
+    pending.clear();
     state.running = false;
   }
 }
