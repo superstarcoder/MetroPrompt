@@ -11,3 +11,71 @@ html, body {
   height: 100%;
   overflow: hidden;
 }
+
+/* Pixel-themed chat markdown */
+.chat-md p { margin: 0 0 0.4em 0; }
+.chat-md p:last-child { margin-bottom: 0; }
+.chat-md ul, .chat-md ol { margin: 0.2em 0 0.4em 1.2em; padding: 0; }
+.chat-md li { margin: 0.1em 0; }
+.chat-md code {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  padding: 0 0.25em;
+  font-size: 0.95em;
+}
+.chat-md pre {
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  padding: 0.5em 0.6em;
+  margin: 0.4em 0;
+  overflow-x: auto;
+}
+.chat-md pre code { background: transparent; border: 0; padding: 0; }
+.chat-md h1, .chat-md h2, .chat-md h3, .chat-md h4 {
+  margin: 0.3em 0 0.2em 0;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.chat-md h1 { font-size: 1.05em; }
+.chat-md h2 { font-size: 1.0em; }
+.chat-md h3 { font-size: 0.95em; }
+.chat-md a { color: #67e8f9; text-decoration: underline; }
+.chat-md blockquote {
+  border-left: 3px solid rgba(255, 255, 255, 0.35);
+  padding-left: 0.6em;
+  margin: 0.3em 0;
+  opacity: 0.85;
+}
+.chat-md strong { color: #fff; }
+.chat-md hr {
+  border: 0;
+  border-top: 1px dashed rgba(255, 255, 255, 0.25);
+  margin: 0.5em 0;
+}
+.chat-md table {
+  border-collapse: collapse;
+  margin: 0.4em 0;
+  font-size: 0.95em;
+}
+.chat-md th, .chat-md td {
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  padding: 0.2em 0.5em;
+}
+
+/* Pixel-art scrollbar — chunky and subtle */
+.chat-md::-webkit-scrollbar,
+[data-mayor-ui] *::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+[data-mayor-ui] *::-webkit-scrollbar-track {
+  background: #0b1220;
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
+}
+[data-mayor-ui] *::-webkit-scrollbar-thumb {
+  background: #1a2540;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+}
+[data-mayor-ui] *::-webkit-scrollbar-thumb:hover {
+  background: #2a3a60;
+}

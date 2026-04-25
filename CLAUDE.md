@@ -12,6 +12,7 @@ A pixel-art agentic city builder for a hackathon. The user prompts a **Mayor age
 - **Rendering:** Pixi.js v8 (vanilla, dynamically imported inside `useEffect`) — WebGL, nearest-neighbor scaling for crisp pixel art
 - **Agents:** **Claude Managed Agents** (Anthropic's hosted agent loop). Our placement helpers are exposed as **custom tools** — the Mayor fires `agent.custom_tool_use` events, our backend applies them to the `City` and responds with `user.custom_tool_result`. See `app/lib/agent/mayor.ts`.
 - **Streaming:** Two-layer SSE — Anthropic's session event stream → our Next.js route handler (runs the custom-tool loop) → browser EventSource. See `app/app/api/mayor/[sessionId]/stream/route.ts`.
+- **Markdown rendering:** `react-markdown` + `remark-gfm` in the chat panel for agent text (Mayor/Zone messages render with full GFM support — lists, tables, code, links, blockquotes). Styles live in `app/app/globals.css` under `.chat-md`.
 - **Pixel art:** PixelLab (AI-assisted isometric sprite generation)
 
 ## Project Structure
@@ -35,14 +36,14 @@ MetroPrompt/
             message/route.ts                   — POST: send redirect (user.message)
     components/
       CityRendererWrapper.tsx — 'use client', owns the ssr:false dynamic import
-      CityRenderer.tsx        — 'use client', Pixi.js renderer + Mayor control UI + SSE consumer
+      CityRenderer.tsx        — 'use client', Pixi.js renderer + draggable/minimizable chat panel (controls + agent feed + tool-call cards) + SSE consumer
     lib/
       all_types.tsx      — simulation data schema, source of truth
       renderConfig.ts    — per-sprite render offsets and scale (visual tuning only)
       agent/
-        tools.ts         — ToolCall union, TOOL_SCHEMAS (Mayor) + ZONE_TOOL_SCHEMAS (Zone, no delegate_zones), applyToolCall
+        tools.ts         — ToolCall union, TOOL_SCHEMAS (Mayor) + ZONE_TOOL_SCHEMAS (Zone, no delegate_zones), applyToolCall, grass-only validation for buildings + nature
         observation.ts   — buildObservation (dormant; kept for future prompt-pumped variants)
-        mayor.ts         — MAYOR_MODEL const, MAYOR_SYSTEM, ensureMayor, createMayorSession, runMayorLoop, sendInterrupt, sendRedirect; delegate_zones handler (intersection check + parallel Zone fan-out)
+        mayor.ts         — MAYOR_MODEL const, MAYOR_SYSTEM, ensureMayor, createMayorSession, runMayorLoop, sendInterrupt, sendRedirect; delegate_zones handler (intersection check + auto-trim of road/sidewalk borders + parallel Zone fan-out)
         zone.ts          — ZONE_MODEL const, ZONE_SYSTEM, ensureZone, runZoneBuild (bbox-enforced custom-tool loop, returns summary)
     scripts/
       test_step1.ts      — npx tsx smoke test for the tool dispatcher + observation builder
@@ -60,9 +61,11 @@ Two-tier multi-agent on Claude Managed Agents: **Mayor** (coordinator) + **Zone*
 
 - **Design insight:** LLMs can't reliably emit clean 50×50 ASCII grids, but they're great at structured tool calls. ASCII is dev-only input/output; agents talk to the world via tool calls validated at the call site — `placeProperty` / `placeTileRect` throw on overlap + OOB with structured coordinates that the Mayor (or Zone) reads and retries.
 - **Custom-tool pattern:** all our tools are declared on the agent configs (no container execution). Agent emits `agent.custom_tool_use` → our server runs `applyToolCall` (with bbox enforcement for Zones) → sends `user.custom_tool_result`. See §Mayor Agent below.
-- **Mayor's job (whole-city builds):** lay road + sidewalk grid → partition the grid into 4–8 non-overlapping zones → call `delegate_zones` ONCE with bbox + free-text instructions per zone → optionally place a few signature buildings directly → `finish`. The Mayor does NOT fill in zones itself; that's the Zone agents' job.
-- **Mayor's job (small edits / partial builds):** place buildings directly with the placement tools, no delegation. Configurable in `MAYOR_SYSTEM`.
-- **Zone's job:** receive bbox + Mayor's instructions, place buildings inside the bbox, call `finish` when done. Hard bbox enforcement on every tool call (rejects placements outside the assigned region with structured errors so the Zone self-corrects). Zones run in parallel via `Promise.allSettled` — bboxes don't intersect (validated server-side), so concurrent mutation of the shared `City` is safe.
+- **Mayor's job (whole-city builds):** lay road + sidewalk grid → partition the grid into 4–8 non-overlapping zones → call `delegate_zones` ONCE with bbox + free-text instructions per zone → optionally place a few signature buildings or scatter cross-zone landmarks/nature directly → `finish`. The Mayor does NOT fill in zones itself; that's the Zone agents' job.
+- **Mayor's job (small edits / partial builds):** place buildings, tiles, or nature directly with the placement tools, no delegation. Configurable in `MAYOR_SYSTEM`.
+- **Zone's job:** receive bbox + Mayor's instructions, place buildings + nature inside the bbox, call `finish` when done. Hard bbox enforcement on every tool call (rejects placements outside the assigned region with structured errors so the Zone self-corrects). Zones run in parallel via `Promise.allSettled` — bboxes don't intersect (validated server-side), so concurrent mutation of the shared `City` is safe.
+- **Auto-trim of Zone bboxes:** before fan-out, the Mayor's requested bbox for each zone is greedily trimmed inward as long as any edge row/column contains a road/sidewalk/crosswalk/intersection/pavement tile. The Zone receives the trimmed (grass-interior) bbox, so it can never overwrite the Mayor's road network. The Mayor's *original* bbox is what's stored in `completedZoneBboxes` for future-overlap checks (matches the Mayor's mental model of "I claimed this rectangle"). Any trims are reported back to the Mayor in the `delegate_zones` result text under `bbox adjustments:`. See `trimInfrastructureFromBbox` in `mayor.ts`.
+- **Grass-only placement rule:** every cell of a building footprint must be grass; nature (tree/flower_patch/bush) can only sit on grass. The handlers in `tools.ts` enforce this with structured errors before mutating the city. Combined with auto-trim, this means Zones effectively own a pure-grass interior and never collide with infrastructure.
 - **Model swap:** `MAYOR_MODEL` in `mayor.ts` and `ZONE_MODEL` in `zone.ts` are top-of-file constants. Flip both to `claude-opus-4-7` for demo day — two-line change.
 
 ## Build Stages
@@ -70,10 +73,12 @@ Two-tier multi-agent on Claude Managed Agents: **Mayor** (coordinator) + **Zone*
 2. **Pixel art + rendering system** ✅ — Pixi.js isometric renderer with pan/zoom, grid overlay toggle
 3. **Mayor agent via Managed Agents** ✅ — see §Mayor Agent
 4. **Connect backend to frontend** ✅ — SSE live build, Build button + Pause + Redirect UI in `CityRenderer.tsx`
-5. **Batch tools** ✅ — `place_properties` / `place_tile_rects` array variants. One Mayor turn lays the entire road grid; one Mayor turn delegates all zones.
-6. **Multi-agent split (Mayor + parallel Zone agents)** ✅ — `delegate_zones` Mayor tool + `app/lib/agent/zone.ts`. Hard bbox enforcement, intersection-checked, runs zones via `Promise.allSettled`.
-7. **Remaining polish (deferred)** — `pdf`/`docx` skill for the post-sim report, `web_search` preamble, `code_execution` for sim stats, memory stores for cross-playthrough learning, stream reconnect (MA Pattern 1), per-zone interrupt UI.
-8. **7-day citizen simulation + feedback loop** — needs decay, pathfinding, citizens generate feedback → Mayor report
+5. **Batch tools** ✅ — `place_properties` / `place_tile_rects` / `place_natures` array variants. One Mayor turn lays the entire road grid; one Mayor turn delegates all zones.
+6. **Multi-agent split (Mayor + parallel Zone agents)** ✅ — `delegate_zones` Mayor tool + `app/lib/agent/zone.ts`. Hard bbox enforcement, intersection-checked, auto-trim of road borders, runs zones via `Promise.allSettled`.
+7. **Nature placement tools** ✅ — `place_nature` / `place_natures` for both Mayor and Zone agents (trees, flower patches, bushes). Grass-only validation enforced by handler.
+8. **Chat UI overhaul** ✅ — unified draggable, minimizable pixel-themed chat panel on the right with markdown agent messages and color-coded tool-call cards (auto-grouped by `tool_use_id` prefix so batched calls collapse into a single card).
+9. **Remaining polish (deferred)** — `pdf`/`docx` skill for the post-sim report, `web_search` preamble, `code_execution` for sim stats, memory stores for cross-playthrough learning, stream reconnect (MA Pattern 1), per-zone interrupt UI.
+10. **7-day citizen simulation + feedback loop** — needs decay, pathfinding, citizens generate feedback → Mayor report
 
 ## Rendering System (Stage 2 — complete)
 
@@ -98,8 +103,9 @@ Because properties anchor at their back corner and the painter's sort uses that 
 - Texture path resolved via `TILE_META[CODE_TO_TILE[char]].image` — single source of truth in `all_types.tsx`
 
 ### Nature rendering
-- `Nature` items (`tree`, `flower_patch`, `bush`) are randomly spawned inside `init()` on grass cells that aren't occupied by a property (~4% tree, ~4% flower_patch, ~2% bush).
+- `Nature` items (`tree`, `flower_patch`, `bush`) are placed by the Mayor or Zone agents via `place_nature` / `place_natures`. The scene starts with no nature; greenery streams in alongside buildings during the build.
 - Rendered like tiles: `anchor.set(0.5, 0)`, same scale formula, offsets pulled from `TILE_RENDER` (same record as tiles) keyed by `renderKey(nat.image)` — e.g. `tree_v3`, `flower_patch_v1`, `bush_v1`.
+- Server stores the default variant (`TREE_IMAGES[0]` etc); the browser picks a random variant via `pickNatureImage` for visual variety, mirroring the property-variant roulette.
 
 ### Property rendering
 - `anchor.set(0.5, 0)` — top vertex of footprint diamond pinned to grid position
@@ -109,16 +115,16 @@ Because properties anchor at their back corner and the painter's sort uses that 
 - **Placement convention:** `(gx, gy)` = top corner of diamond footprint. A 3×3 property at (0,0) occupies cells (0,0)–(2,2).
 
 ### Texture loading
-- Tile textures keyed by image path — `tileTex['/assets/grass_1_1.png']`, collected from `Object.values(TILE_META).map(m => m.image)`
-- Property textures keyed by image path — `propTex['/assets/apartment_v1_3_3.png']`, collected from `city.all_properties`
-- Nature textures keyed by image path — `natureTex['/assets/tree_v3_1_1.png']`, collected from `city.all_nature`
-- All unique paths collected upfront and loaded in parallel via `Assets.load`
+- Tile textures keyed by image path — `tileTex['/assets/grass_1_1.png']`, collected from `ALL_TILE_IMAGES`
+- Property textures keyed by image path — `propTex['/assets/apartment_v1_3_3.png']`, collected from `ALL_PROP_IMAGES` (`PROPERTY_DEFAULTS` ∪ `HOUSE_IMAGES` ∪ `APARTMENT_IMAGES` ∪ `OFFICE_IMAGES`)
+- Nature textures keyed by image path — `natureTex['/assets/tree_v3_1_1.png']`, collected from `ALL_NATURE_IMAGES` (`TREE_IMAGES` ∪ `FLOWER_PATCH_IMAGES` ∪ `BUSH_IMAGES`)
+- All unique paths collected at module top and loaded in parallel via `Assets.load` so `tool_applied` events render immediately without load gaps
 
 ### Scene lifecycle (`CityRenderer.tsx`)
 - `GRID_SIZE = 50` (50×50 demo grid; real `City` schema uses 500×500).
 - **Empty on mount** — `cityRef.current = initCity(50)` (all grass, no buildings). The scene fills in live as the Mayor streams tool events.
 - **Textures preloaded upfront** — every possible tile + property variant (`ALL_TILE_IMAGES`, `ALL_PROP_IMAGES` at module top), so `tool_applied` events render immediately without load gaps.
-- **Re-render scheduling** — each `tool_applied` event mutates `cityRef.current` via `placeProperty` / `placeTileRect`, then calls `scheduleRender()` which coalesces to a single `requestAnimationFrame` (so a batch of 10 tool calls per Mayor turn = one repaint, not ten).
+- **Re-render scheduling** — each `tool_applied` event mutates `cityRef.current` via `placeProperty` / `placeTileRect` / `placeNature`, then calls `scheduleRender()` which coalesces to a single `requestAnimationFrame` (so a batch of 10 tool calls per Mayor turn = one repaint, not ten).
 - **Two-layer world container** — `world > spritesLayer + gridLines`. Repaints clear `spritesLayer.removeChildren()` only; `gridLines` survives.
 - **Client-side variant roulette** — when the Mayor emits `place_property(apartment, …)` the browser picks a random image from `APARTMENT_IMAGES` for visual variety. The server's parallel copy uses `PROPERTY_DEFAULTS[name].image`. They diverge only on cosmetic variant — not on structure.
 
@@ -205,9 +211,9 @@ Helpers (all in `all_types.tsx`):
 - `placeTile(city, x, y, name: TileName)` — sets `tile_grid[y][x] = TILE_CODES[name]`. No validation (fast).
 - `placeTileRect(city, x1, y1, x2, y2, name: TileName)` — fills a rectangle (corners inclusive, normalized). **Throws** on OOB with grid dims in the message. This is the Mayor's primary ground-paint brush.
 - `placeProperty(city, property)` — **throws** on OOB or footprint overlap with an existing property, with both building names + coordinates in the error. Pushes to `all_properties` on success. Does **not** touch `tile_grid`; buildings sit on grass by convention.
-- `placeNature(city, nature)` — pushes to `all_nature`. No validation.
-- `getTileAt(city, position): TileName` — decodes via `CODE_TO_TILE`.
-- `getPropertyAt(city, position): Property | undefined` — O(n) scan over `all_properties` for a footprint covering `position`.
+- `placeNature(city, nature)` — pushes to `all_nature`. No validation at this layer; the grass-only and "no overlap with building" checks live in `tools.ts → handlePlaceNature`.
+- `getTileAt(city, position): TileName` — decodes via `CODE_TO_TILE`. Used by `handlePlaceProperty` to scan the footprint for non-grass cells and by `handlePlaceNature` for the grass check.
+- `getPropertyAt(city, position): Property | undefined` — O(n) scan over `all_properties` for a footprint covering `position`. Used by `handlePlaceNature` to reject building-occupied cells.
 
 ### TileCode — single-char codes
 `TILE_CODES`, `NATURE_CODES`, `PROPERTY_CODES` are the forward maps (name → char). `CODE_TO_TILE`, `CODE_TO_NATURE`, `CODE_TO_PROPERTY` are their inverses. Uppercase = buildings, lowercase = nature, symbols = ground tiles. `H` = hospital (universal map convention); house is `D`.
@@ -229,21 +235,24 @@ Helpers (all in `all_types.tsx`):
 ## Mayor + Zone Agents (`app/lib/agent/`)
 
 ### Tool set
-The Mayor has 6 tools; Zones have 5 (no `delegate_zones` — recursion banned).
+The Mayor has 8 tools; Zones have 7 (no `delegate_zones` — recursion banned).
 
 | Tool | Mayor | Zone | Notes |
 |---|---|---|---|
-| `place_property(property, x, y)` | ✅ | ✅ | One building. Throws on overlap + OOB (Zone also checks bbox). |
+| `place_property(property, x, y)` | ✅ | ✅ | One building. Rejects on overlap, OOB, or any non-grass cell in the footprint (Zone also checks bbox). |
 | `place_properties(properties[])` | ✅ | ✅ | Many buildings, one call. Per-item validation, partial-success result. |
 | `place_tile_rect(tile, x1, y1, x2, y2)` | ✅ | ✅ | One ground-tile rectangle. |
 | `place_tile_rects(rects[])` | ✅ | ✅ | Many rects, one call. Mayor lays the entire road grid in one of these. |
-| `delegate_zones(zones[])` | ✅ | ❌ | Mayor-only. `zones: [{bbox, instructions}, ...]`. Validates bboxes server-side then fans out to parallel Zone sessions via `Promise.allSettled`. |
+| `place_nature(nature, x, y)` | ✅ | ✅ | One 1×1 tree/flower_patch/bush. Rejected if not on a grass tile or if a building covers the cell (Zone also checks bbox). |
+| `place_natures(natures[])` | ✅ | ✅ | Many nature items, one call. Per-item validation, partial-success result. |
+| `delegate_zones(zones[])` | ✅ | ❌ | Mayor-only. `zones: [{bbox, instructions}, ...]`. Validates + auto-trims bboxes server-side then fans out to parallel Zone sessions via `Promise.allSettled`. |
 | `finish(reason)` | ✅ | ✅ | Ends the agent's loop. Mayor's `finish` ends the build; Zone's `finish` ends just that Zone session. |
 
 ### `tools.ts`
-- `ToolCall` discriminated union for the singletons (`place_property` | `place_tile_rect` | `finish`). Batch tools and `delegate_zones` are handled inline in `mayor.ts` / `zone.ts` rather than expanding the union.
-- `applyToolCall(city, call) → ToolResult` — wraps the throwing placement helpers into `{ ok: true }` / `{ ok: false, error }`. Used by both Mayor and Zone loops.
-- `TOOL_SCHEMAS` — full JSON-schema list passed to the Mayor's `agents.create({ tools })`. Includes `delegate_zones`.
+- `ToolCall` discriminated union for the singletons (`place_property` | `place_tile_rect` | `place_nature` | `finish`). Batch tools and `delegate_zones` are handled inline in `mayor.ts` / `zone.ts` rather than expanding the union.
+- Handlers (`handlePlaceProperty`, `handlePlaceTileRect`, `handlePlaceNature`, `handleFinish`) — wrap the throwing placement helpers into `{ ok: true }` / `{ ok: false, error }`, plus enforce the **grass-only rule** (every footprint cell or nature target must be `grass`; rejection includes the offending cell + its current tile name).
+- `applyToolCall(city, call) → ToolResult` — central dispatcher used by both Mayor and Zone loops.
+- `TOOL_SCHEMAS` — full JSON-schema list passed to the Mayor's `agents.create({ tools })`. Includes `delegate_zones`, `place_nature`, `place_natures`.
 - `ZONE_TOOL_SCHEMAS` — `TOOL_SCHEMAS` minus `delegate_zones`. Passed to the Zone's `agents.create({ tools })`. Same identity as `TOOL_SCHEMAS` after filtering — easy to keep in sync.
 
 ### `mayor.ts`
@@ -253,24 +262,25 @@ The Mayor has 6 tools; Zones have 5 (no `delegate_zones` — recursion banned).
 - `createMayorSession(goal)` — `sessions.create()`, stashes `{ city: initCity(50), pendingGoal, interrupted: false, completedZoneBboxes: [] }` in a module-level `sessions` Map.
 - `runMayorLoop(sessionId, onEvent)` — stream-first: opens `events.stream()`, sends the kickoff `user.message` after. For each `agent.custom_tool_use`:
   - Singletons → `applyToolCall`, send tool_result.
-  - `place_properties` / `place_tile_rects` → unroll into per-item synthetic `tool_applied` events for the frontend, send a single composite `tool_result` text back to MA.
-  - `delegate_zones` → normalize bboxes, validate (in-grid + intra-batch no-intersect + no-intersect with `state.completedZoneBboxes`), fan out to `runZoneBuild()` via `Promise.allSettled`, aggregate summaries, append successful bboxes to `completedZoneBboxes`. Validation failures return a structured error so the Mayor retries without spawning anything.
+  - `place_properties` / `place_tile_rects` / `place_natures` → unroll into per-item synthetic `tool_applied` events for the frontend (each tagged with `${event.id}#${i}` so the UI can group), send a single composite `tool_result` text back to MA.
+  - `delegate_zones` → normalize bboxes, validate (in-grid + intra-batch no-intersect + no-intersect with `state.completedZoneBboxes`), then **auto-trim** each bbox via `trimInfrastructureFromBbox` (peels road/sidewalk/crosswalk/intersection/pavement off the edges), skips zones with no grass interior, fans out the trimmed bboxes to `runZoneBuild()` via `Promise.allSettled`, aggregates summaries (including a `bbox adjustments:` block listing trims), appends each Mayor's *original* bbox (pre-trim) to `completedZoneBboxes`. Validation failures return a structured error so the Mayor retries without spawning anything.
   - `finish` → terminate loop.
   - Turn cap = `MAX_CUSTOM_TOOL_USES = 70`. Counts at the tool-call level, so a `place_properties` with 30 items or a `delegate_zones` with 6 zones each = 1 against the cap.
+- Helpers `INFRA_TILES`, `isInfrastructure`, `trimInfrastructureFromBbox` live at the top of `mayor.ts` — the trim is a greedy four-edge peel that loops until every edge row/column is pure grass (or the bbox collapses, in which case it returns null and the zone is skipped).
 - `sendInterrupt(sessionId)` / `sendRedirect(sessionId, text)` — same UI pause/redirect mechanics as before. Note: only the Mayor's session is interruptible; Zones run to their own `finish`.
 - `MayorStreamEvent` is a discriminated union: `anthropic_event` | `tool_applied` (with optional `source: 'mayor' | 'zone'` tag) | `zone_message` | `done`.
 
 ### `zone.ts`
 - `ZONE_MODEL` constant (same Sonnet 4.6 by default).
-- `ZONE_SYSTEM` prompt — terse: "you own this bbox, here are your instructions, place buildings, call finish." Explicitly tells the Zone it does NOT see the rest of the city — trust the Mayor's instructions for adjacency context. Hard bbox rule documented inline so the model knows what'll be rejected.
+- `ZONE_SYSTEM` prompt — terse: "you own this bbox, here are your instructions, place buildings + nature, call finish." Documents the GRASS-ONLY RULE and HARD BBOX RULE inline so the model knows what'll be rejected. Includes density guidance: pack buildings tight (one tile of grass between for fire safety), spread civic infrastructure across roads, scatter ~10–25 nature items per zone.
 - `ensureZone()` — create-or-reuse the Zone agent. Reads `ZONE_AGENT_ID` from env; if missing, logs the new ID for `.env.local`. Reuses `MAYOR_ENV_ID` (env passed in by the Mayor's handler — no separate environment).
 - `runZoneBuild(bbox, instructions, city, envId, zoneIndex, onEvent) → ZoneBuildResult`:
   - `sessions.create()` with the Zone agent.
-  - Kickoff message: just bbox + Mayor's instructions + "place buildings, prefer batch, call finish when done." No full-city ASCII (intentionally — see "Why no ASCII for Zones" below).
-  - Custom-tool loop with bbox validation on every singleton + batch tool call (per-item for batches). Out-of-bbox calls return `(x,y) is outside your zone bbox (x1,y1)-(x2,y2)` so the Zone self-corrects.
-  - Tracks placement counts by type for the summary ("ok: 14 buildings — 8 house, 2 apartment, 1 park, 3 restaurant").
+  - Kickoff message: just (auto-trimmed) bbox + Mayor's instructions + "place buildings, prefer batch, call finish when done." No full-city ASCII (intentionally — see "Why no ASCII for Zones" below).
+  - Custom-tool loop with bbox validation on every singleton + batch tool call (per-item for batches). `bboxContainsProperty` for buildings, `bboxContainsTileRect` for tile rects, `bboxContainsPosition` for nature. Out-of-bbox calls return `(x,y) is outside your zone bbox (x1,y1)-(x2,y2)` so the Zone self-corrects.
+  - Tracks placement counts by type for the summary ("ok: 14 placements — 8 house, 2 apartment, 1 park, 3 restaurant" — counts include nature).
   - Forwards `tool_applied` and `zone_message` events upstream via `onEvent` so the browser renders Zone placements live through the same SSE pipe.
-- `Bbox = { x1, y1, x2, y2 }` exported type. Bboxes are normalized (min/max corners) by the Mayor before being passed to `runZoneBuild`, so Zone code can assume `x1 ≤ x2, y1 ≤ y2`.
+- `Bbox = { x1, y1, x2, y2 }` exported type. Bboxes are normalized (min/max corners) and infrastructure-trimmed by the Mayor before being passed to `runZoneBuild`, so Zone code can assume `x1 ≤ x2, y1 ≤ y2` and that the bbox interior is pure grass at delegation time.
 
 ### Why no ASCII for Zones
 Initial design passed `cityToAscii(city)` in the Zone kickoff so the agent could see roads + neighbors. Removed because: (a) it added ~2.5K chars per zone session, mostly never referenced; (b) the Zone's whole point is *focused attention on its bbox*, and dumping the full city dilutes that; (c) the Mayor already sees the full map and can encode any needed spatial context (road borders, neighbor character) directly into each zone's `instructions` string. Cleaner mental model, smaller prompt, better outputs in practice.
@@ -284,9 +294,15 @@ Initial design passed `cityToAscii(city)` in the Zone kickoff so the agent could
 All four routes return `{ error: "..." }` with 404/400/500 on unknown sessionId / missing fields / server error.
 
 ### Frontend integration (`components/CityRenderer.tsx`)
-- Mayor control panel (top-left): goal textarea, Build button, status chip (`idle` / `running` / `paused` / `done`), Pause button (while running), Redirect textarea + "Resume with nudge" button (while paused), Mayor's-thoughts scroll panel showing recent `agent.message` texts.
-- Build flow: clears local `cityRef`, POSTs `/api/mayor`, opens `new EventSource(.../stream)`, listens for `event: mayor`. On each `tool_applied` with `result.ok === true` (regardless of `source`) calls `placeProperty` / `placeTileRect` against the local city and `scheduleRender()`. Zone events are mechanically identical to Mayor events on the wire — the `source` tag is purely informational.
+- **Unified chat panel (top-right by default, draggable + minimizable, pixel themed):** one `w-[26rem] h-[75vh]` card combines status, agent feed, tool-call cards, and the controls dock. Header is the drag handle (`onMouseDown` → `dragStateRef`, window-level `mousemove`/`mouseup` listeners update `panelPos` until release, clamped to viewport). A `_` / `▢` button toggles `minimized`, which unmounts the feed + composer and drops the height class so the panel collapses to the header bar.
+- **Composer dock** at the bottom of the panel switches by status:
+  - `idle` / `done` → goal textarea + cyan **▶ Build**.
+  - `running` → goal textarea (disabled) + amber **❚❚ Pause Mayor**.
+  - `paused` → pulsing amber badge + redirect textarea + emerald **▶ Resume with nudge**.
+- **Feed entries** are a `FeedItem` discriminated union: `{ kind: 'message', author: 'mayor' | 'zone', text }` rendered through `react-markdown` + `remark-gfm` inside a `.chat-md` card, OR `{ kind: 'tool_batch', name, source, items[] }` rendered as a color-coded compact card (fuchsia `▣` properties, amber `▭` tiles, emerald `✿` nature, sky `✓` finish) with an `[MAYOR/ZONE] · ▣ name ×N` header and per-item rows like `› apartment @ (12,8)` (failures show in rose with the error inline). Cards auto-grouped by `tool_use_id.split('#')[0]` so a 30-item `place_properties` collapses into a single card with `+ N more…`. Auto-scroll on new entries.
+- **Build flow:** clears local `cityRef` and `feed`, POSTs `/api/mayor`, opens `new EventSource(.../stream)`, listens for `event: mayor`. On each `tool_applied` it (1) pushes to the feed via `pushToolApplied`, (2) if `result.ok === true`, calls `placeProperty` / `placeTileRect` / `placeNature` against the local city and `scheduleRender()`. `agent.message` events push a `mayor` message; `zone_message` events push a `zone` message. The `source` tag on `tool_applied` is purely for labeling — frontend handles Mayor and Zone events identically.
 - During multi-zone builds, several quadrants fill in concurrently rather than corner-to-corner — clear visual signal that parallel Zone agents are working.
+- Pixi pan/zoom handlers ignore events whose target is inside `[data-mayor-ui]`, so the chat panel and grid toggle don't pan the canvas.
 
 ### Environment variables (`app/.env.local`)
 - `ANTHROPIC_API_KEY` — required.

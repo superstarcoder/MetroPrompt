@@ -2,7 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { applyToolCall, ZONE_TOOL_SCHEMAS } from './tools';
 import type { ToolCall, ToolResult } from './tools';
 import { PROPERTY_DEFAULTS } from '../all_types';
-import type { City, PropertyName, TileName } from '../all_types';
+import type { City, NatureName, PropertyName, TileName } from '../all_types';
 
 // ============================================================
 // MODEL + AGENT CONFIG
@@ -23,6 +23,10 @@ A Mayor agent is building a 50×50 city and has delegated one region to you. You
 
 Focus on your bbox. You do NOT see the rest of the city — trust the Mayor's instructions for any context about the surroundings. Place buildings inside your bbox that realize the Mayor's brief. Be creative within it.
 
+GRASS-ONLY RULE (enforced server-side — violations are rejected)
+- Every cell of a building footprint must be grass. Buildings cannot sit on roads, sidewalks, crosswalks, intersections, or pavement.
+- Nature (tree, flower_patch, bush) can only be placed on grass.
+
 HARD BBOX RULE (enforced server-side — violations are rejected)
 Every building's full footprint must fit ENTIRELY inside your bbox:
   - For a 3×3 building anchored at (x, y): x >= bbox.x1 AND y >= bbox.y1 AND x+2 <= bbox.x2 AND y+2 <= bbox.y2
@@ -34,6 +38,7 @@ TOOLS
 - place_property(property, x, y): anchor one building.
 - place_properties(properties: [...]): MANY buildings in one call — preferred for efficiency.
 - place_tile_rect / place_tile_rects: add pavement, crosswalks, or sidewalks inside your bbox. (Roads between zones are the Mayor's job — don't re-lay them.)
+- place_nature(nature, x, y) / place_natures([...]): drop 1×1 trees, flower_patches, or bushes on free GRASS cells inside your bbox. ALL nature is grass-only — placing a tree, flower_patch, or bush on a sidewalk / road / crosswalk / intersection / pavement is rejected. The Mayor's auto-trim already strips infrastructure off your bbox edges, so the cells you own are mostly grass; just steer clear of any building footprints you've already placed. Prefer the batch variant.
 - finish(reason): signal your zone is done.
 
 3×3 footprints: park, hospital, school, grocery_store, apartment, office, fire_station, police_station, power_plant, shopping_mall, theme_park.
@@ -43,8 +48,12 @@ STRATEGY
 1. Read your bbox, the Mayor's instructions, and the ASCII snapshot.
 2. Briefly plan in one message — what buildings, roughly where, how they realize the brief.
 3. Emit ONE place_properties call with the whole list. Fall back to individual place_property only if you need to adapt after a partial failure.
-4. Call finish when your region is populated to match the brief.
-5. Important: Don't leave large empty regions. Fill it up with things!
+4. After placing buildings, scatter greenery or place them in an organized fashion — emit ONE place_natures call with trees / bushes / flower_patches on free grass cells inside your bbox. Aim for ~10–25 items in a typical 10×10–15×15 zone, clustered around buildings and along sidewalks rather than uniform noise.
+5. Call finish when your region is populated to match the brief.
+6. Important: Don't leave large empty regions of grass or nature. Fill it up with properties, unless otherwise specified!
+7. Try to generate a densely packed city, unless otherwise instructed. Have one tile of grass between buildings for fire safety, but otherwise pack them in tight to maximize the city's population and vibrancy.
+8. Place a lot of properties (unless otherwise specified)! The more the better. We want to create a dense and vibrant city.
+9. Unless otherwise specified, try to ensure police station, fire station, and hospitals are next to roads for accessibility, and not all clumped together
 
 Do not explain at length. The city speaks for itself.`;
 
@@ -101,6 +110,21 @@ function bboxContainsProperty(
   return { ok: true };
 }
 
+function bboxContainsPosition(
+  bbox: Bbox,
+  x: number,
+  y: number,
+): { ok: true } | { ok: false; error: string } {
+  if (x < bbox.x1 || y < bbox.y1 || x > bbox.x2 || y > bbox.y2) {
+    return {
+      ok: false,
+      error:
+        `(${x},${y}) is outside your zone bbox (${bbox.x1},${bbox.y1})–(${bbox.x2},${bbox.y2})`,
+    };
+  }
+  return { ok: true };
+}
+
 function bboxContainsTileRect(
   bbox: Bbox,
   x1: number, y1: number,
@@ -137,6 +161,7 @@ export type ZoneEvent =
 
 type PlacePropertyItem = { property: PropertyName; x: number; y: number };
 type PlaceTileRectItem = { tile: TileName; x1: number; y1: number; x2: number; y2: number };
+type PlaceNatureItem = { nature: NatureName; x: number; y: number };
 
 // ============================================================
 // ZONE BUILD — spawn session, run bbox-enforced loop, return summary
@@ -224,6 +249,9 @@ export async function runZoneBuild(
     if (result.ok && name === 'place_property') {
       const prop = (input as PlacePropertyItem).property;
       counts[prop] = (counts[prop] ?? 0) + 1;
+    } else if (result.ok && name === 'place_nature') {
+      const nat = (input as PlaceNatureItem).nature;
+      counts[nat] = (counts[nat] ?? 0) + 1;
     }
     onEvent({
       kind: 'tool_applied',
@@ -301,6 +329,32 @@ export async function runZoneBuild(
           continue;
         }
 
+        // BATCH: place_natures
+        if (event.name === 'place_natures') {
+          const items = (event.input as { natures?: PlaceNatureItem[] }).natures ?? [];
+          let okCount = 0;
+          const failures: string[] = [];
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const bboxCheck = bboxContainsPosition(bbox, item.x, item.y);
+            let result: ToolResult;
+            if (!bboxCheck.ok) {
+              result = { ok: false, error: bboxCheck.error };
+            } else {
+              result = applyToolCall(city, { name: 'place_nature', input: item });
+            }
+            emitToolApplied(`${event.id}#${i}`, 'place_nature', item as unknown as Record<string, unknown>, result);
+            if (result.ok) okCount++;
+            else failures.push(`[${i}] place_nature(${item.nature}, ${item.x}, ${item.y}): ${result.error}`);
+          }
+          const text = failures.length === 0
+            ? `ok: all ${items.length} placed`
+            : `partial: ${okCount}/${items.length} placed\nfailed:\n${failures.join('\n')}`;
+          await sendResult(event.id, text, failures.length > 0);
+          await sendCapNudgeIfHit();
+          continue;
+        }
+
         // SINGLETON path
         let call: ToolCall | null = null;
         if (event.name === 'place_property') {
@@ -323,6 +377,16 @@ export async function runZoneBuild(
             continue;
           }
           call = { name: 'place_tile_rect', input: item };
+        } else if (event.name === 'place_nature') {
+          const item = event.input as unknown as PlaceNatureItem;
+          const bboxCheck = bboxContainsPosition(bbox, item.x, item.y);
+          if (!bboxCheck.ok) {
+            emitToolApplied(event.id, event.name, event.input, { ok: false, error: bboxCheck.error });
+            await sendResult(event.id, bboxCheck.error, true);
+            await sendCapNudgeIfHit();
+            continue;
+          }
+          call = { name: 'place_nature', input: item };
         } else if (event.name === 'finish') {
           call = { name: 'finish', input: event.input as { reason: string } };
         }
@@ -331,7 +395,7 @@ export async function runZoneBuild(
           ? applyToolCall(city, call)
           : {
               ok: false,
-              error: `unknown tool '${event.name}'. Zone tools: place_property, place_properties, place_tile_rect, place_tile_rects, finish`,
+              error: `unknown tool '${event.name}'. Zone tools: place_property, place_properties, place_tile_rect, place_tile_rects, place_nature, place_natures, finish`,
             };
 
         emitToolApplied(event.id, event.name, event.input, result);
@@ -371,8 +435,8 @@ export async function runZoneBuild(
     .join(', ');
   const summary =
     total === 0
-      ? `zone ${zoneIndex} (${bbox.x1},${bbox.y1})–(${bbox.x2},${bbox.y2}): no buildings placed${finished ? ' (finished cleanly)' : ' (loop exited)'}`
-      : `zone ${zoneIndex} (${bbox.x1},${bbox.y1})–(${bbox.x2},${bbox.y2}): ${total} buildings — ${breakdown}`;
+      ? `zone ${zoneIndex} (${bbox.x1},${bbox.y1})–(${bbox.x2},${bbox.y2}): nothing placed${finished ? ' (finished cleanly)' : ' (loop exited)'}`
+      : `zone ${zoneIndex} (${bbox.x1},${bbox.y1})–(${bbox.x2},${bbox.y2}): ${total} placements — ${breakdown}`;
 
   return {
     ok: true,

@@ -4,8 +4,53 @@ import { applyToolCall, TOOL_SCHEMAS } from './tools';
 import type { ToolCall, ToolResult } from './tools';
 import { runZoneBuild } from './zone';
 import type { Bbox, ZoneEvent } from './zone';
-import { initCity } from '../all_types';
-import type { City, PropertyName, TileName } from '../all_types';
+import { initCity, CODE_TO_TILE } from '../all_types';
+import type { City, NatureName, PropertyName, TileName } from '../all_types';
+
+// Tile names the Mayor reserves for circulation infrastructure. Zone bboxes are
+// auto-shrunk inward so the Zone never owns these — keeps Zone agents from
+// overwriting (or trying to build on top of) the Mayor's road network.
+const INFRA_TILES: ReadonlySet<TileName> = new Set<TileName>([
+  'road_one_way',
+  'road_two_way',
+  'road_intersection',
+  'crosswalk',
+  'sidewalk',
+  'pavement',
+]);
+
+function isInfrastructure(city: City, x: number, y: number): boolean {
+  const tile = CODE_TO_TILE[city.tile_grid[y][x]];
+  return tile ? INFRA_TILES.has(tile) : false;
+}
+
+// Greedy inward trim: while any of the bbox's four edges contains an infra tile,
+// peel that edge off. Returns null if the bbox has no infra-free interior.
+function trimInfrastructureFromBbox(city: City, bbox: Bbox): Bbox | null {
+  let { x1, y1, x2, y2 } = bbox;
+  let changed = true;
+  while (changed) {
+    if (x1 > x2 || y1 > y2) return null;
+    changed = false;
+
+    let topHas = false;
+    for (let x = x1; x <= x2; x++) if (isInfrastructure(city, x, y1)) { topHas = true; break; }
+    if (topHas) { y1++; changed = true; continue; }
+
+    let botHas = false;
+    for (let x = x1; x <= x2; x++) if (isInfrastructure(city, x, y2)) { botHas = true; break; }
+    if (botHas) { y2--; changed = true; continue; }
+
+    let leftHas = false;
+    for (let y = y1; y <= y2; y++) if (isInfrastructure(city, x1, y)) { leftHas = true; break; }
+    if (leftHas) { x1++; changed = true; continue; }
+
+    let rightHas = false;
+    for (let y = y1; y <= y2; y++) if (isInfrastructure(city, x2, y)) { rightHas = true; break; }
+    if (rightHas) { x2--; changed = true; continue; }
+  }
+  return { x1, y1, x2, y2 };
+}
 
 // ============================================================
 // MODEL SWAP — one line to flip for demo day.
@@ -30,12 +75,15 @@ TOOLS
   * 3×3 footprint: park, hospital, school, grocery_store, apartment, office, fire_station, police_station, power_plant, shopping_mall, theme_park
   * 2×2 footprint: house, restaurant
 - place_tile_rect(tile, x1, y1, x2, y2): fill a rectangle of ground tiles (corners inclusive). Tile names: grass, pavement, road_one_way, road_two_way, road_intersection, crosswalk, sidewalk. A single cell is x1=x2, y1=y2. Use this for roads and sidewalks — ONE call lays a whole band.
+- place_nature(nature, x, y) / place_natures([...]): drop 1×1 decorative greenery (tree, flower_patch, bush) on free GRASS cells only. Anything not on grass — roads, sidewalks, crosswalks, intersections, pavement, or building footprints — is rejected. Use it to line streets (place trees on the grass strip BESIDE the sidewalk, never on the sidewalk itself), soften zone edges, decorate parks, and fill awkward gaps. Prefer the batch variant.
 - finish(reason): signal the city is complete. Call exactly ONCE when you're satisfied.
 
 RULES (enforced — violations return structured errors with coordinates)
 1. Building footprints cannot overlap any existing building. Edge-to-edge contact is fine.
 2. Footprints must fit in-bounds: x+w ≤ 50, y+h ≤ 50.
-3. If a tool fails, read the coordinates in the error message and retry at a valid position.
+3. EVERY cell of a building footprint must be grass — placing a building on top of a road, sidewalk, crosswalk, intersection, or pavement is rejected. Plan your roads first, then place buildings on the grass between them.
+4. Nature (tree / flower_patch / bush) can ONLY be placed on grass — never on roads, sidewalks, crosswalks, intersections, or pavement.
+5. If a tool fails, read the coordinates in the error message and retry at a valid position.
 
 The user may either want you to build out the whole city or may ask you to make improvements or build only a part of it. Based on the goal, decide on the right strategy and adapt as you go. The city evolves with each tool call, so always consider the current state when placing new elements.
 
@@ -46,16 +94,23 @@ You are the coordinator. You lay the infrastructure (roads + sidewalks) and part
 2. Lay the ENTIRE road grid in ONE place_tile_rects call. Roads are typically 2 tiles wide — a full-width horizontal road is one item: { tile: "road_two_way", x1: 0, y1: 12, x2: 49, y2: 13 }. Include all road bands (horizontal and vertical) in this one call.
 3. Lay 1-tile sidewalks on both sides of each road, plus optional crosswalks at intersections, in ONE more place_tile_rects call.
 4. Call delegate_zones ONCE with the full list of zones. For each zone write SPECIFIC, CREATIVE instructions — not just "residential" but "dense walkable residential: apartments along the main road, houses in the interior, one small park at the north edge, a grocery store on the corner." The richer and more imaginative your instructions, the richer the zone's output. Zone sub-agents are specialists; they thrive on concrete direction.
+   AUTO-TRIM: the server will automatically peel any roads / sidewalks / crosswalks / pavement off the edges of each bbox before passing it to the Zone — the Zone never sees those tiles inside its bbox. So you can size each bbox generously up to the road centerlines without worrying about the Zone overwriting your network; the trimmed grass interior is what the Zone actually owns.
    IMPORTANT: Zones do NOT see the rest of the city — they only see their bbox + your instructions. So INCLUDE SPATIAL CONTEXT in every zone's instructions: which edges of the bbox border roads (e.g. "main road on east edge at x=11-12, sidewalk on south at y=11"), and what the neighboring zones will contain ("commercial strip directly south, residential to the east"). Without this, zones can't orient their buildings toward roads or create natural gradients with neighbors.
 5. Be sure to include infrastructure (for example: the center zone can be mostly civic with a hospital and school, but also has the power plant and fire station tucked in the southeast corner or spread throughout the zones so that there is more variety and less clumping). A zone with a mix of building types is more interesting to look at and explore.
 6. Don't make the zones too big — 10×10 or 15×15 is a good size. Smaller zones with tight instructions yield denser, more coherent results.
 6. Call finish(reason) when the city feels complete.
+7. Tell each zone to scatter some greenery (trees, bushes, flower_patches) across its region — this is part of their job, not a Mayor-level pass.
 
 Notes:
-- Don't leave large empty regions. Don't keep it extremely packed either. Ensure that the zone agent understands that every property must have at least one tile of grass next to it. 
+- Ensure that the zone agent understands that it should not leave large empty regions. 
 - Zone bboxes must not overlap each other OR any previously-delegated zone in this session. The server rejects overlapping bboxes with a clear error listing the offending pair; just normalize and retry.
 - You retain all your own tools (place_property, place_properties, place_tile_rect, place_tile_rects). Use them for cross-zone landmarks or post-delegation touch-ups, not for filling in zones directly.
 - Adapt these guidelines as needed based on the user's prompt!
+
+Defaults:
+- Have the center zone be the most commercial/office heavy, put more residential zones on the outskirts zones
+- Avoid large empty areas without any buildings
+- Try to ensure police station, fire station, and hospitals are next to roads for accessibility, and not all clumped together
 
 STRATEGY (if asked to build a specific building or amenity or small cluster or neighborhood or to make improvements)
 1. Sketch mentally before placing anything.
@@ -217,7 +272,12 @@ function parseToolCall(
   name: string,
   input: Record<string, unknown>,
 ): ToolCall | null {
-  if (name === 'place_property' || name === 'place_tile_rect' || name === 'finish') {
+  if (
+    name === 'place_property' ||
+    name === 'place_tile_rect' ||
+    name === 'place_nature' ||
+    name === 'finish'
+  ) {
     return { name, input: input as never } as ToolCall;
   }
   return null;
@@ -225,6 +285,7 @@ function parseToolCall(
 
 type PlacePropertyItem = { property: PropertyName; x: number; y: number };
 type PlaceTileRectItem = { tile: TileName; x1: number; y1: number; x2: number; y2: number };
+type PlaceNatureItem = { nature: NatureName; x: number; y: number };
 type DelegateZonesItem = { bbox: Bbox; instructions: string };
 
 function formatProperty(item: PlacePropertyItem): string {
@@ -232,6 +293,9 @@ function formatProperty(item: PlacePropertyItem): string {
 }
 function formatTileRect(item: PlaceTileRectItem): string {
   return `place_tile_rect(${item.tile}, ${item.x1},${item.y1}–${item.x2},${item.y2})`;
+}
+function formatNature(item: PlaceNatureItem): string {
+  return `place_nature(${item.nature}, ${item.x}, ${item.y})`;
 }
 function formatBbox(b: Bbox): string {
   return `(${b.x1},${b.y1})–(${b.x2},${b.y2})`;
@@ -387,6 +451,39 @@ export async function runMayorLoop(
           continue;
         }
 
+        // ---- BATCH: place_natures ----
+        if (event.name === 'place_natures') {
+          const items =
+            (event.input as { natures?: PlaceNatureItem[] }).natures ?? [];
+          let okCount = 0;
+          const failures: string[] = [];
+
+          for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const result = applyToolCall(state.city, {
+              name: 'place_nature',
+              input: item,
+            });
+            onEvent({
+              kind: 'tool_applied',
+              tool_use_id: `${event.id}#${i}`,
+              name: 'place_nature',
+              input: item as unknown as Record<string, unknown>,
+              result,
+            });
+            if (result.ok) okCount++;
+            else failures.push(`[${i}] ${formatNature(item)}: ${result.error}`);
+          }
+
+          const text =
+            failures.length === 0
+              ? `ok: all ${items.length} placed`
+              : `partial: ${okCount}/${items.length} placed\nfailed:\n${failures.join('\n')}`;
+          await sendResult(text, failures.length > 0);
+          await sendCapNudgeIfHit();
+          continue;
+        }
+
         // ---- DELEGATE_ZONES: fan out to parallel Zone agents ----
         if (event.name === 'delegate_zones') {
           const rawZones =
@@ -437,6 +534,25 @@ export async function runMayorLoop(
             continue;
           }
 
+          // Auto-shrink each requested bbox so it excludes any roads/sidewalks
+          // the Mayor laid. Zones never see those tiles inside their bbox, so
+          // they can't overwrite them or try to build on top.
+          const trimNotes: string[] = [];
+          const trimmed: Array<{ original: Bbox; bbox: Bbox; instructions: string } | { skip: true; reason: string; index: number }> = [];
+          for (let i = 0; i < zones.length; i++) {
+            const z = zones[i];
+            const t = trimInfrastructureFromBbox(state.city, z.bbox);
+            if (!t) {
+              trimNotes.push(`[${i}] ${formatBbox(z.bbox)} has no grass interior after stripping infrastructure — skipped`);
+              trimmed.push({ skip: true, reason: 'all infrastructure', index: i });
+              continue;
+            }
+            if (t.x1 !== z.bbox.x1 || t.y1 !== z.bbox.y1 || t.x2 !== z.bbox.x2 || t.y2 !== z.bbox.y2) {
+              trimNotes.push(`[${i}] ${formatBbox(z.bbox)} → ${formatBbox(t)} (trimmed roads/sidewalks)`);
+            }
+            trimmed.push({ original: z.bbox, bbox: t, instructions: z.instructions });
+          }
+
           // Adapter: Zone emits ZoneEvent, Mayor forwards as MayorStreamEvent.
           const zoneAdapter = (e: ZoneEvent) => {
             if (e.kind === 'tool_applied') {
@@ -453,38 +569,59 @@ export async function runMayorLoop(
             }
           };
 
-          // Spawn all zones in parallel. Use allSettled so one zone crashing
-          // doesn't wipe the rest.
-          const zoneResults = await Promise.allSettled(
-            zones.map((z, i) =>
+          // Spawn only the zones that have a non-empty interior after trimming.
+          // Skipped zones report back to the Mayor in the summary so they can
+          // adjust the partition next turn.
+          const spawnIndices: number[] = [];
+          const spawnPromises: Promise<import('./zone').ZoneBuildResult>[] = [];
+          for (let i = 0; i < trimmed.length; i++) {
+            const t = trimmed[i];
+            if ('skip' in t) continue;
+            spawnIndices.push(i);
+            spawnPromises.push(
               runZoneBuild(
-                z.bbox,
-                z.instructions,
+                t.bbox,
+                t.instructions,
                 state.city,
-                cachedEnvId as string, // ensureMayor ran before this, so envId is set
+                cachedEnvId as string,
                 i,
                 zoneAdapter,
               ),
-            ),
-          );
+            );
+          }
+          const zoneResults = await Promise.allSettled(spawnPromises);
 
           // Aggregate summary for the Mayor.
           const lines: string[] = [];
+          if (trimNotes.length > 0) {
+            lines.push(`bbox adjustments:\n${trimNotes.join('\n')}`);
+          }
           let totalBuildings = 0;
-          for (let i = 0; i < zoneResults.length; i++) {
-            const res = zoneResults[i];
+          for (let k = 0; k < zoneResults.length; k++) {
+            const res = zoneResults[k];
+            const i = spawnIndices[k];
             if (res.status === 'fulfilled') {
               lines.push(res.value.summary);
               totalBuildings += Object.values(res.value.counts).reduce((a, b) => a + b, 0);
-              // Track the zone's bbox so future delegate_zones calls can't overlap it.
-              state.completedZoneBboxes.push(res.value.bbox);
+              // Track the Mayor's ORIGINAL bbox (pre-trim) so future delegate_zones
+              // calls can't overlap territory the Mayor has already claimed,
+              // even if the actual Zone interior was smaller.
+              state.completedZoneBboxes.push(zones[i].bbox);
             } else {
               const msg = res.reason instanceof Error ? res.reason.message : String(res.reason);
               lines.push(`zone ${i} FAILED: ${msg}`);
             }
           }
+          // Mention skipped zones in the summary too.
+          for (let i = 0; i < trimmed.length; i++) {
+            const t = trimmed[i];
+            if ('skip' in t) {
+              lines.push(`zone ${i} skipped — no buildable interior`);
+            }
+          }
+          const spawned = spawnPromises.length;
           const text =
-            `All ${zones.length} zones completed. Total buildings: ${totalBuildings}.\n\n` +
+            `${spawned}/${zones.length} zones spawned. Total placements: ${totalBuildings}.\n\n` +
             lines.join('\n');
           await sendResult(text, false);
           await sendCapNudgeIfHit();
@@ -497,7 +634,7 @@ export async function runMayorLoop(
           ? applyToolCall(state.city, call)
           : {
               ok: false,
-              error: `unknown tool '${event.name}'. Valid: place_property, place_properties, place_tile_rect, place_tile_rects, finish`,
+              error: `unknown tool '${event.name}'. Valid: place_property, place_properties, place_tile_rect, place_tile_rects, place_nature, place_natures, delegate_zones, finish`,
             };
 
         onEvent({

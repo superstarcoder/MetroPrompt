@@ -1,10 +1,24 @@
 import {
   PROPERTY_DEFAULTS,
   TILE_META,
+  TREE_IMAGES,
+  FLOWER_PATCH_IMAGES,
+  BUSH_IMAGES,
   placeProperty,
   placeTileRect,
+  placeNature,
+  getPropertyAt,
+  getTileAt,
 } from '../all_types';
-import type { City, PropertyName, TileName } from '../all_types';
+import type { City, NatureName, PropertyName, TileName } from '../all_types';
+
+const NATURE_NAMES: NatureName[] = ['tree', 'flower_patch', 'bush'];
+
+function defaultNatureImage(name: NatureName): string {
+  if (name === 'tree') return TREE_IMAGES[0];
+  if (name === 'flower_patch') return FLOWER_PATCH_IMAGES[0];
+  return BUSH_IMAGES[0];
+}
 
 // ============================================================
 // TOOL CALL SHAPES
@@ -16,6 +30,7 @@ import type { City, PropertyName, TileName } from '../all_types';
 export type ToolCall =
   | { name: 'place_property'; input: { property: PropertyName; x: number; y: number } }
   | { name: 'place_tile_rect'; input: { tile: TileName; x1: number; y1: number; x2: number; y2: number } }
+  | { name: 'place_nature'; input: { nature: NatureName; x: number; y: number } }
   | { name: 'finish'; input: { reason: string } };
 
 export type ToolResult =
@@ -36,6 +51,24 @@ function handlePlaceProperty(
       ok: false,
       error: `place_property: unknown property '${args.property}'. Valid: ${Object.keys(PROPERTY_DEFAULTS).join(', ')}`,
     };
+  }
+  // Reject if any cell in the footprint is not grass — buildings can't sit on
+  // roads, sidewalks, crosswalks, intersections, or pavement.
+  const h = city.tile_grid.length;
+  const w = city.tile_grid[0]?.length ?? 0;
+  for (let dy = 0; dy < def.height; dy++) {
+    for (let dx = 0; dx < def.width; dx++) {
+      const x = args.x + dx;
+      const y = args.y + dy;
+      if (x < 0 || y < 0 || x >= w || y >= h) continue; // OOB handled by placeProperty
+      const tile = getTileAt(city, { x, y });
+      if (tile !== 'grass') {
+        return {
+          ok: false,
+          error: `place_property: '${args.property}' footprint cell (${x},${y}) is '${tile}', buildings can only sit on grass`,
+        };
+      }
+    }
   }
   try {
     placeProperty(city, {
@@ -67,6 +100,46 @@ function handlePlaceTileRect(
   }
 }
 
+function handlePlaceNature(
+  city: City,
+  args: { nature: NatureName; x: number; y: number },
+): ToolResult {
+  if (!NATURE_NAMES.includes(args.nature)) {
+    return {
+      ok: false,
+      error: `place_nature: unknown nature '${args.nature}'. Valid: ${NATURE_NAMES.join(', ')}`,
+    };
+  }
+  const h = city.tile_grid.length;
+  const w = city.tile_grid[0]?.length ?? 0;
+  if (args.x < 0 || args.y < 0 || args.x >= w || args.y >= h) {
+    return {
+      ok: false,
+      error: `place_nature: (${args.x},${args.y}) is out of bounds (grid ${w}x${h})`,
+    };
+  }
+  const blocking = getPropertyAt(city, { x: args.x, y: args.y });
+  if (blocking) {
+    return {
+      ok: false,
+      error: `place_nature: (${args.x},${args.y}) is occupied by '${blocking.name}' at (${blocking.position.x},${blocking.position.y})`,
+    };
+  }
+  const tile = getTileAt(city, { x: args.x, y: args.y });
+  if (tile !== 'grass') {
+    return {
+      ok: false,
+      error: `place_nature: ${args.nature} can only grow on grass; (${args.x},${args.y}) is '${tile}'`,
+    };
+  }
+  placeNature(city, {
+    name: args.nature,
+    position: { x: args.x, y: args.y },
+    image: defaultNatureImage(args.nature),
+  });
+  return { ok: true };
+}
+
 function handleFinish(_city: City, _args: { reason: string }): ToolResult {
   return { ok: true, done: true };
 }
@@ -79,6 +152,7 @@ export function applyToolCall(city: City, call: ToolCall): ToolResult {
   switch (call.name) {
     case 'place_property':  return handlePlaceProperty(city, call.input);
     case 'place_tile_rect': return handlePlaceTileRect(city, call.input);
+    case 'place_nature':    return handlePlaceNature(city, call.input);
     case 'finish':          return handleFinish(city, call.input);
   }
 }
@@ -102,6 +176,8 @@ type ToolSchema = {
     | 'place_properties'
     | 'place_tile_rect'
     | 'place_tile_rects'
+    | 'place_nature'
+    | 'place_natures'
     | 'delegate_zones'
     | 'finish';
   description: string;
@@ -120,7 +196,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       'Footprint extends down-right from the anchor. ' +
       '3x3 buildings: park, hospital, school, grocery_store, apartment, office, fire_station, police_station, power_plant, shopping_mall, theme_park. ' +
       '2x2 buildings: house, restaurant. ' +
-      'Footprints must fit in-bounds and must not overlap any existing building.',
+      'Footprints must fit in-bounds, must not overlap any existing building, and EVERY cell of the footprint must be grass (not road, sidewalk, crosswalk, intersection, or pavement).',
     input_schema: {
       type: 'object',
       properties: {
@@ -135,7 +211,7 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     name: 'place_properties',
     description:
       'Place MANY buildings in one tool call. PREFERRED when placing more than one building — collapses N place_property calls into one, saving turns. ' +
-      'Each item is validated independently against the current city state; partial success is reported back as text — successful items are placed, failed items are listed by index with their error so you can retry just those.',
+      'Each item is validated independently against the current city state; partial success is reported back as text — successful items are placed, failed items are listed by index with their error so you can retry just those. Same rules as place_property: in-bounds, no overlap with existing buildings, footprint must be entirely on grass.',
     input_schema: {
       type: 'object',
       properties: {
@@ -199,6 +275,49 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
         },
       },
       required: ['rects'],
+    },
+  },
+  {
+    name: 'place_nature',
+    description:
+      'Place a SINGLE 1x1 nature decoration (tree, flower_patch, or bush) at (x, y). For two or more in the same turn, prefer place_natures. ' +
+      'Nature is purely decorative — it sits on top of the ground tile but cannot be placed where a building footprint already exists. ' +
+      'ALL nature (tree / flower_patch / bush) can only be placed on grass tiles — placing on a road, sidewalk, crosswalk, intersection, or pavement is rejected. ' +
+      'Use it to soften zones, line streets with trees, fill awkward gaps, and add greenery around parks/houses.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        nature: { type: 'string', enum: NATURE_NAMES },
+        x: { type: 'integer', minimum: 0 },
+        y: { type: 'integer', minimum: 0 },
+      },
+      required: ['nature', 'x', 'y'],
+    },
+  },
+  {
+    name: 'place_natures',
+    description:
+      'Place MANY nature decorations (trees / flower_patches / bushes) in one tool call. PREFERRED when scattering greenery — collapses N place_nature calls into one. ' +
+      'Each item is validated independently against the current city; partial success is reported back as text. ' +
+      'Cells covered by an existing building are rejected per-item. ALL nature (tree / flower_patch / bush) must sit on grass — placing on roads, sidewalks, crosswalks, intersections, or pavement will fail. Restrict to grass cells.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        natures: {
+          type: 'array',
+          minItems: 1,
+          items: {
+            type: 'object',
+            properties: {
+              nature: { type: 'string', enum: NATURE_NAMES },
+              x: { type: 'integer', minimum: 0 },
+              y: { type: 'integer', minimum: 0 },
+            },
+            required: ['nature', 'x', 'y'],
+          },
+        },
+      },
+      required: ['natures'],
     },
   },
   {
