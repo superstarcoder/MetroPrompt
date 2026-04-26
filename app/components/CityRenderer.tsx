@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { initCity } from '@/lib/all_types';
 import type { City, Person } from '@/lib/all_types';
+import type { FireTruck } from './city/useSimulation';
 import { saveCity } from '@/lib/cityStore';
 import { GRID_SIZE } from './city/constants';
 import { useCityScene } from './city/useCityScene';
@@ -15,6 +16,7 @@ import { Palette } from './city/Palette';
 import { CitizenStatsPopup } from './city/CitizenStatsPopup';
 import { CitizenSpeechBubble } from './city/CitizenSpeechBubble';
 import { PropertyInfoPopup } from './city/PropertyInfoPopup';
+import { ResponseTimePopup } from './city/ResponseTimePopup';
 import { sendCitizenChat, initialChatState, type ChatState } from './city/citizenChat';
 
 
@@ -116,6 +118,11 @@ export default function CityRenderer({
   // tick; useCityScene reads it for visual lerp.
   const tickStartedAtRef = useRef<number>(0);
 
+  // Active fire truck. Lifted here (not owned by useSimulation) because
+  // useCityScene runs first and needs the ref at hook-call time. useSimulation
+  // mutates it; useCityScene reads it each render.
+  const activeFireTruckRef = useRef<FireTruck | null>(null);
+
   // Pixi scene: owns app/world/layers, texture preload, painter loop, pan/zoom,
   // click/drag/hover plumbing, the floating delete-button anchor, and citizen
   // rendering (painter-sorted with properties + nature).
@@ -133,6 +140,7 @@ export default function CityRenderer({
     selectedCitizenRef,
     setSelectedCitizen,
     tickStartedAtRef,
+    activeFireTruckRef,
   });
 
   // Hand scheduleRender + worldRef back to the editor so its callbacks can use them.
@@ -153,12 +161,17 @@ export default function CityRenderer({
     stopSim,
     pauseSim,
     resumeSim,
+    fireTruckActive,
+    dispatchFireTruck,
+    responseReport,
+    dismissResponseReport,
   } = useSimulation({
     cityRef,
     scheduleRender,
     selectedCitizenRef,
     setSelectedCitizen,
     tickStartedAtRef,
+    activeFireTruckRef,
   });
 
   // Save-city UI (only shown in the post-build `done` dock)
@@ -415,6 +428,30 @@ export default function CityRenderer({
           cityRef={cityRef}
           worldRef={worldRef}
           onClose={() => editor.setSelectedEntity(null)}
+          canDispatchFire={
+            simState === 'running' &&
+            !fireTruckActive &&
+            editor.selectedEntity.data.name !== 'fire_station'
+          }
+          onDispatchFire={() => {
+            const sel = editor.selectedEntity;
+            if (sel?.kind !== 'property') return;
+            const result = dispatchFireTruck(sel.data);
+            if (!result.ok) {
+              // Surface the failure inline. (No UI element for this yet —
+              // alert is the cheapest path.)
+              alert(`🚒 ${result.reason}`);
+            }
+          }}
+        />
+      )}
+
+      {/* Response time report — appears when a truck arrives at the scene. */}
+      {responseReport && (
+        <ResponseTimePopup
+          elapsedMs={responseReport.elapsedMs}
+          targetName={responseReport.targetName}
+          onClose={dismissResponseReport}
         />
       )}
     </div>

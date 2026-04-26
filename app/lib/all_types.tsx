@@ -396,6 +396,11 @@ export type Person = {
   // renderer to lerp screen position smoothly between cells while still
   // advancing the logical grid position one cell per tick.
   prev_location?: Position;
+  // Cells the citizen walked through THIS tick, in order, ending at
+  // current_location. Length 1..WALK_CELLS_PER_TICK. Populated by runTick;
+  // the renderer uses it to lerp segment-by-segment so paths that turn
+  // a corner inside a single tick don't render as diagonal cuts.
+  tick_path?: Position[];
   // While selected by the user, the citizen freezes at the fractional
   // (mid-lerp) position they were at when clicked, instead of snapping to
   // current_location. Set in the Pixi click handler, cleared on deselect.

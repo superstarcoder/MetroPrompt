@@ -52,3 +52,5 @@ export const CITIZEN_RENDER: Record<string, RenderOffset> = {
   man_walking_south_east_6: { offsetX: 0, offsetY: -10, scale: 0.48 },
   man_walking_south_west_6: { offsetX: 0, offsetY: -10, scale: 0.48 },
 };
+
+export const FIRE_TRUCK_RENDER: RenderOffset = { offsetX: 0, offsetY: -18, scale: 0.85 };

@@ -4,16 +4,19 @@ import { useCallback, useEffect, useRef } from 'react';
 import type { RefObject } from 'react';
 import { CODE_TO_TILE, TILE_META } from '@/lib/all_types';
 import type { City, Nature, Person, Property } from '@/lib/all_types';
-import { CITIZEN_RENDER, PROP_RENDER, TILE_RENDER } from '@/lib/renderConfig';
+import { CITIZEN_RENDER, FIRE_TRUCK_RENDER, PROP_RENDER, TILE_RENDER } from '@/lib/renderConfig';
 import { SIMULATION } from '@/lib/sim/constants';
 import { GRID_SIZE, TILE_H, TILE_W, gridToScreen } from './constants';
 import {
   ALL_NATURE_IMAGES,
   ALL_PROP_IMAGES,
   ALL_TILE_IMAGES,
+  FIRE_TRUCK_IMAGES,
   citizenDirection,
   renderKey,
 } from './imageHelpers';
+import type { TruckDirection } from './imageHelpers';
+import type { FireTruck } from './useSimulation';
 import {
   CITIZEN_IMAGE_FRONT,
   CITIZEN_FRAME_COUNT,
@@ -42,6 +45,8 @@ type Args = {
   selectedCitizenRef: RefObject<Person | null>;
   setSelectedCitizen: (p: Person | null) => void;
   tickStartedAtRef: RefObject<number>;
+  // Fire truck — read-only for the renderer; useSimulation owns mutation.
+  activeFireTruckRef: RefObject<FireTruck | null>;
 };
 
 type Result = {
@@ -91,6 +96,7 @@ export function useCityScene({
   selectedCitizenRef,
   setSelectedCitizen,
   tickStartedAtRef,
+  activeFireTruckRef,
 }: Args): Result {
   const pixiModRef = useRef<AnyTex>(null);
   const worldRef = useRef<AnyTex>(null);
@@ -105,6 +111,10 @@ export function useCityScene({
   const citizenIdleTexRef = useRef<AnyTex>(null);
   const citizenFrameTexRef = useRef<Record<Exclude<CitizenDirection, 'idle'>, AnyTex[]>>({
     NE: [], NW: [], SE: [], SW: [],
+  });
+  // Fire truck textures, one per direction. Preloaded alongside the rest.
+  const fireTruckTexRef = useRef<Record<TruckDirection, AnyTex>>({
+    NE: null, NW: null, SE: null, SW: null,
   });
   // Bounding boxes of rendered citizen sprites in screen coords, captured each
   // doRender. Used by the mount-level pointerdown handler to detect citizen
@@ -187,11 +197,13 @@ export function useCityScene({
       }
     }
 
-    // Pass 2 — nature, properties, and citizens, painter-sorted by depth (x+y of anchor / lerped position).
+    // Pass 2 — nature, properties, citizens, and the fire truck, painter-sorted
+    // by depth (x+y of anchor / lerped position).
     type Drawable =
       | { kind: 'nature'; data: Nature; depth: number }
       | { kind: 'property'; data: Property; depth: number }
-      | { kind: 'citizen'; data: Person; depth: number; gx: number; gy: number; direction: CitizenDirection };
+      | { kind: 'citizen'; data: Person; depth: number; gx: number; gy: number; direction: CitizenDirection }
+      | { kind: 'fire_truck'; depth: number; gx: number; gy: number; direction: TruckDirection };
 
     const drawables: Drawable[] = [];
     for (const n of city.all_nature) {
@@ -229,12 +241,46 @@ export function useCityScene({
         gy = cur.y;
         direction = 'idle';
       } else {
-        gx = prev.x + (cur.x - prev.x) * progress;
-        gy = prev.y + (cur.y - prev.y) * progress;
-        direction = citizenDirection(prev, cur);
+        // Segment-by-segment lerp through `tick_path`. Citizens advance up
+        // to WALK_CELLS_PER_TICK cells per logical tick, so a single
+        // straight prev → cur lerp would cut corners (turning the path
+        // diagonal at sidewalk/crosswalk transitions). We split the
+        // [0..1] tick progress evenly across the cells walked this tick
+        // and lerp within whichever segment we're currently in.
+        const tp = c.tick_path;
+        if (tp && tp.length > 0) {
+          const segCount = tp.length;
+          const segIdx = Math.min(segCount - 1, Math.floor(progress * segCount));
+          const segT = progress * segCount - segIdx;
+          const segStart = segIdx === 0 ? prev : tp[segIdx - 1];
+          const segEnd = tp[segIdx];
+          gx = segStart.x + (segEnd.x - segStart.x) * segT;
+          gy = segStart.y + (segEnd.y - segStart.y) * segT;
+          direction = citizenDirection(segStart, segEnd);
+        } else {
+          // No movement this tick (idle or just spawned). Stand still.
+          gx = cur.x;
+          gy = cur.y;
+          direction = 'idle';
+        }
       }
       drawables.push({ kind: 'citizen', data: c, depth: gx + gy, gx, gy, direction });
     }
+
+    // Fire truck (single, optional). Drawn at its lerped sub-tile position.
+    const truck = activeFireTruckRef.current;
+    if (truck) {
+      const tgx = truck.visualPosition.x;
+      const tgy = truck.visualPosition.y;
+      drawables.push({
+        kind: 'fire_truck',
+        depth: tgx + tgy,
+        gx: tgx,
+        gy: tgy,
+        direction: truck.direction,
+      });
+    }
+
     drawables.sort((a, b) => a.depth - b.depth);
 
     for (const d of drawables) {
@@ -275,6 +321,17 @@ export function useCityScene({
         spritesLayer.addChild(sprite);
         const hl = highlightFor(n);
         if (hl) addHighlightCopy(sprite, tex, hl.color, hl.alpha);
+      } else if (d.kind === 'fire_truck') {
+        const tex = fireTruckTexRef.current[d.direction];
+        if (!tex) continue;
+        const { x, y } = gridToScreen(d.gx, d.gy);
+        const cfg = FIRE_TRUCK_RENDER;
+        const sprite = new Sprite(tex);
+        sprite.anchor.set(0.5, 0);
+        sprite.scale.set((TILE_W / tex.width) * cfg.scale);
+        sprite.x = x + cfg.offsetX;
+        sprite.y = y + cfg.offsetY;
+        spritesLayer.addChild(sprite);
       } else if (d.kind === 'citizen') {
         const c = d.data;
         const tex = d.direction === 'idle'
@@ -309,7 +366,7 @@ export function useCityScene({
         });
       }
     }
-  }, [cityRef, entityDragRef, hoveredEntityRef, selectedEntityRef, selectedCitizenRef, tickStartedAtRef]);
+  }, [cityRef, entityDragRef, hoveredEntityRef, selectedEntityRef, selectedCitizenRef, tickStartedAtRef, activeFireTruckRef]);
 
   const scheduleRender = useCallback(() => {
     if (rafHandleRef.current != null) return;
@@ -356,6 +413,10 @@ export function useCityScene({
         citizenFrameTexRef.current[dir] = textures;
       };
 
+      const loadFireTruck = async (dir: TruckDirection) => {
+        fireTruckTexRef.current[dir] = await Assets.load(FIRE_TRUCK_IMAGES[dir]);
+      };
+
       await Promise.all([
         ...ALL_TILE_IMAGES.map(async p => { tileTexRef.current[p] = await Assets.load(p); }),
         ...ALL_PROP_IMAGES.map(async p => { propTexRef.current[p] = await Assets.load(p); }),
@@ -365,6 +426,10 @@ export function useCityScene({
         loadCitizenFrames('NW'),
         loadCitizenFrames('SE'),
         loadCitizenFrames('SW'),
+        loadFireTruck('NE'),
+        loadFireTruck('NW'),
+        loadFireTruck('SE'),
+        loadFireTruck('SW'),
       ]);
       if (destroyed) { app.destroy(true); return; }
       texturesReadyRef.current = true;

@@ -12,9 +12,14 @@ type Props = {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   worldRef: RefObject<any>;
   onClose: () => void;
+  // Fire emergency dispatch — only present when a sim is running.
+  // canDispatchFire: gates the 🔥 button visibility (running + no truck active
+  // + this is not a fire station itself).
+  canDispatchFire?: boolean;
+  onDispatchFire?: () => void;
 };
 
-export function PropertyInfoPopup({ property, cityRef, worldRef, onClose }: Props) {
+export function PropertyInfoPopup({ property, cityRef, worldRef, onClose, canDispatchFire, onDispatchFire }: Props) {
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -70,14 +75,28 @@ export function PropertyInfoPopup({ property, cityRef, worldRef, onClose }: Prop
           <span className="text-fuchsia-300 uppercase tracking-wider truncate">{heading}</span>
           {subhead && <span className="text-white/40 text-[9px] uppercase tracking-wider">{subhead}</span>}
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          className="text-white/60 hover:text-white px-1 leading-none shrink-0"
-          aria-label="Close info"
-        >
-          ✕
-        </button>
+        <div className="flex items-center gap-1 shrink-0">
+          {canDispatchFire && onDispatchFire && (
+            <button
+              type="button"
+              onClick={onDispatchFire}
+              title="Report a fire — dispatch fire truck"
+              className="w-6 h-6 flex items-center justify-center bg-rose-600 hover:bg-rose-500 text-white text-[12px] border-2 border-white/90 rounded-full leading-none transition-colors"
+              style={{ boxShadow: '2px 2px 0 0 rgba(0,0,0,0.85)' }}
+              aria-label="Report fire"
+            >
+              🔥
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-white/60 hover:text-white px-1 leading-none"
+            aria-label="Close info"
+          >
+            ✕
+          </button>
+        </div>
       </div>
       <div className="flex justify-between mb-2 text-white/70">
         <span>Inside</span>

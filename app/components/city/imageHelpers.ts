@@ -53,6 +53,19 @@ export const ALL_NATURE_IMAGES = [...new Set([
 ])];
 export const ALL_CITIZEN_IMAGES = [...new Set(CITIZEN_IMAGES)];
 
+// Fire truck sprites — one per iso direction. Same NE/NW/SE/SW convention
+// as citizens so direction-mapping logic transfers directly.
+export const FIRE_TRUCK_IMAGES = {
+  NE: '/assets/transportation/fire_truck_north_east.png',
+  NW: '/assets/transportation/fire_truck_north_west.png',
+  SE: '/assets/transportation/fire_truck_south_east.png',
+  SW: '/assets/transportation/fire_truck_south_west.png',
+} as const;
+
+export const ALL_FIRE_TRUCK_IMAGES = Object.values(FIRE_TRUCK_IMAGES);
+
+export type TruckDirection = 'NE' | 'NW' | 'SE' | 'SW';
+
 // Map a one-step grid delta (next - current) to the matching walking sprite.
 // Iso projection: +x → SE, -x → NW, +y → SW, -y → NE.
 // Returns the idle/front sprite when no movement (dx === dy === 0).
@@ -64,6 +77,16 @@ export function citizenDirection(from: Position, to: Position): CitizenDirection
   if (dx === 0 && dy === 0) return 'idle';
   // Prefer the larger axis when the step isn't pure-cardinal (shouldn't happen in
   // 4-connected pathfinding but defensive).
+  if (Math.abs(dx) >= Math.abs(dy)) return dx > 0 ? 'SE' : 'NW';
+  return dy > 0 ? 'SW' : 'NE';
+}
+
+// Same iso projection as citizenDirection but the truck has no idle frame —
+// when stationary we keep the last-known direction (handled by the caller).
+export function truckDirection(from: Position, to: Position): TruckDirection | null {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  if (dx === 0 && dy === 0) return null;
   if (Math.abs(dx) >= Math.abs(dy)) return dx > 0 ? 'SE' : 'NW';
   return dy > 0 ? 'SW' : 'NE';
 }
