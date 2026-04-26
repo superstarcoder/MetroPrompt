@@ -5,6 +5,40 @@
 // 7 days = 168 ticks = 1680 seconds real time (28 minutes)
 // ============================================================
 
+// HUNGER RATE
+// Source: USDA Dietary Guidelines Advisory Committee, 2020
+// "Frequency of Eating in the US Population"
+// https://www.dietaryguidelines.gov/sites/default/files/2020-07/PartD_Ch13_FreqEating_first-print.pdf
+// Finding: 64% of Americans consume 3 meals/day, 28% consume 2 meals/day,
+// 8% are constant grazers (5.7+ eating occasions/day)
+
+// TIREDNESS RATE
+// Source: CDC, Morbidity and Mortality Weekly Report (MMWR), 2016
+// "Prevalence of Healthy Sleep Duration among Adults — United States, 2014"
+// https://www.cdc.gov/mmwr/volumes/65/wr/mm6506a1.htm
+// Finding: 65.2% of adults sleep 7+ hours (adequate),
+// 33.2% sleep <7 hours (short sleep duration),
+// ~1.6% are long sleepers (9+ hours)
+//
+// Additional source: CDC BRFSS / Preventing Chronic Disease, 2023
+// "Prevalence and Geographic Patterns of Self-Reported Short Sleep Duration"
+// https://www.cdc.gov/pcd/issues/2023/22_0400.htm
+
+// BOREDOM RATE
+// Source: USDA Economic Research Service, 2011
+// "How Much Time Do Americans Spend Eating?"
+// https://www.usda.gov/media/blog/2011/11/22/how-much-time-do-americans-spend-eating
+// Finding: Americans spend ~67 min/day on primary eating,
+// remainder split between work, leisure, errands.
+// 4% report no primary eating (constant grazers),
+// 8% spend 4.5+ hours eating/drinking daily.
+//
+// Note: No direct "boredom rate" dataset exists at the federal level.
+// Distribution modeled as normal based on general population
+// leisure/activity patterns from the American Time Use Survey (ATUS).
+// Source: Bureau of Labor Statistics, American Time Use Survey
+// https://www.bls.gov/tus/
+
 export const SIMULATION = {
   tick_interval_ms: 10000,
   hours_per_tick: 1,
