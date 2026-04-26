@@ -10,6 +10,7 @@ export const TILE_RENDER: Record<string, RenderOffset> = {
   pavement:          { offsetX: 0, offsetY: -19, scale: 1.2 },
   flower_patch_v1: { offsetX: 0, offsetY: -15, scale: 1.0 },
   bush_v1:         { offsetX: 0, offsetY: -15, scale: 1.0 },
+  // test:         { offsetX: 0, offsetY: -10, scale: 0.48 }, can be used for man
   tree_v1:         { offsetX: 0, offsetY: -32, scale: 1.2 },
   tree_v2:         { offsetX: 0, offsetY: -20, scale: 1.0 },
   tree_v3:         { offsetX: 0, offsetY: -20, scale: 1.0 },
