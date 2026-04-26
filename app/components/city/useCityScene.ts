@@ -252,8 +252,15 @@ export function useCityScene({
           const segCount = tp.length;
           const segIdx = Math.min(segCount - 1, Math.floor(progress * segCount));
           const segT = progress * segCount - segIdx;
-          const segStart = segIdx === 0 ? prev : tp[segIdx - 1];
+          let segStart = segIdx === 0 ? prev : tp[segIdx - 1];
           const segEnd = tp[segIdx];
+          // Defensive: if seg 0's start (prev_location) is more than one cell
+          // from tp[0], the citizen would otherwise slide diagonally across
+          // multiple cells. Snap segStart to segEnd so they appear at tp[0]
+          // for the duration of seg 0 instead of cutting across the grid.
+          if (segIdx === 0 && Math.abs(segStart.x - segEnd.x) + Math.abs(segStart.y - segEnd.y) > 1) {
+            segStart = segEnd;
+          }
           gx = segStart.x + (segEnd.x - segStart.x) * segT;
           gy = segStart.y + (segEnd.y - segStart.y) * segT;
           direction = citizenDirection(segStart, segEnd);

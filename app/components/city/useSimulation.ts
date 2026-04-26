@@ -5,7 +5,7 @@ import type { RefObject } from 'react';
 import type { City, Person, Position, Property } from '@/lib/all_types';
 import { spawnInitialCitizens } from '@/lib/sim/spawning';
 import { SIMULATION, STAY_DURATION_TICKS, WALK_CELLS_PER_TICK, applyJitter } from '@/lib/sim/constants';
-import { buildWalkabilityGrid } from '@/lib/sim/pathfinding';
+import { buildWalkabilityGrid, nearestEntryTile } from '@/lib/sim/pathfinding';
 import { assignDestination, isAtEntryTile } from '@/lib/sim/decisions';
 import {
   buildDrivabilityGrid,
@@ -26,7 +26,7 @@ export type SimState = 'idle' | 'running' | 'paused' | 'done';
 // or one cell away walking onto it.
 // ============================================================
 
-const TRUCK_MS_PER_TILE = 380;        // ~2.6 cells/sec — visibly urgent but readable
+const TRUCK_MS_PER_TILE = 1235;       // ~0.81 cells/sec — visibly urgent but readable
 const TRUCK_AT_FIRE_DWELL_MS = 1500;  // visible "fire suppressed" beat
 
 export type FireTruckPhase = 'driving_to_fire' | 'at_fire' | 'driving_back';
@@ -143,13 +143,21 @@ export function useSimulation({
       }
 
       // 4. Walking: advance up to WALK_CELLS_PER_TICK cells along the path.
-      // The visual lerp covers the full tick interval regardless, so this
-      // scales walking speed proportionally.
+      // Stop early on direction change so each tick walks a straight segment;
+      // mid-tick L-turns rendered as a fast pivot read as diagonal motion at
+      // crosswalk corners. The citizen pauses one tick at the corner before
+      // resuming in the new direction.
       if (c.current_path.length > 0) {
+        let lastDx = 0, lastDy = 0;
         for (let i = 0; i < WALK_CELLS_PER_TICK && c.current_path.length > 0; i++) {
-          const next = c.current_path.shift()!;
+          const next = c.current_path[0];
+          const dx = next.x - c.current_location.x;
+          const dy = next.y - c.current_location.y;
+          if (i > 0 && (dx !== lastDx || dy !== lastDy)) break;
+          c.current_path.shift();
           c.current_location = next;
           c.tick_path!.push(next);
+          lastDx = dx; lastDy = dy;
         }
         // Arrived at end of path — try to enter the destination, or re-roll.
         if (c.current_path.length === 0) {
@@ -351,6 +359,15 @@ export function useSimulation({
     drivabilityRef.current = buildDrivabilityGrid(cityRef.current);
     tickRef.current = 0;
     for (const c of cityRef.current.all_citizens) {
+      // Citizens spawn at distinct interior cells of their home for visual
+      // separation, but those cells are non-walkable. Snap to the home's
+      // entry tile so the first tick's lerp doesn't slide them diagonally
+      // across the building footprint to the exit cell.
+      const cl = c.current_location;
+      if (!walkabilityRef.current[cl.y][cl.x]) {
+        const exit = nearestEntryTile(c.home, walkabilityRef.current);
+        if (exit) c.current_location = exit;
+      }
       c.prev_location = { ...c.current_location };
       assignDestination(c, cityRef.current, walkabilityRef.current, tickRef.current);
     }
