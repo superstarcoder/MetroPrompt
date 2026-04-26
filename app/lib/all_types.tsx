@@ -368,6 +368,24 @@ export type AgeGroup = "adult" | "child";
 // Display convention: "Engineer @ {job}".
 export type Job = string | null;
 
+// A trip the citizen took (or attempted) during the simulation. Used by the
+// chat endpoint to give Claude grounded context about each citizen's actual
+// experience of the city: where they went, how far, how long.
+//
+// Trips with `arrived_tick === undefined` are in-progress OR were abandoned
+// (citizen rerouted before reaching the destination, e.g. capacity full).
+// Walkability heuristics filter to `arrived_tick !== undefined`.
+export type Trip = {
+  destination_name: PropertyName;
+  destination_company?: string; // for offices
+  start_tick: number;
+  // Number of grid cells the citizen needs to walk from where they decided to
+  // the destination's entry tile. Equals trip duration in ticks since
+  // citizens advance one cell per tick.
+  distance_tiles: number;
+  arrived_tick?: number;
+};
+
 export type Person = {
   name: string;
   age_group: AgeGroup;
@@ -398,6 +416,9 @@ export type Person = {
   boredom_rate: number;     // ~0.06–0.25 per tick (per hour); see BOREDOM_RATE_DISTRIBUTION
   tiredness_rate: number;   // ~0.06–0.25 per tick (per hour); see TIREDNESS_RATE_DISTRIBUTION
   image: string;
+  // Append-only trip log used by the chat endpoint. Pushed on assignDestination
+  // success; arrived_tick stamped on entry. Initialized to [] at spawn.
+  trips: Trip[];
 };
 
 export const randomBetween = (min: number, max: number): number =>
@@ -439,6 +460,7 @@ export const spawnPerson = (
   boredom_rate: weightedNormal(BOREDOM_RATE_DISTRIBUTION),
   tiredness_rate: weightedNormal(TIREDNESS_RATE_DISTRIBUTION),
   image: availableImages[Math.floor(Math.random() * availableImages.length)],
+  trips: [],
 });
 
 // ============================================================

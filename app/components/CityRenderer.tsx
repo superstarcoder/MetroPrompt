@@ -13,7 +13,9 @@ import { useSimulation } from './city/useSimulation';
 import { ChatPanel, type SaveState } from './city/ChatPanel';
 import { Palette } from './city/Palette';
 import { CitizenStatsPopup } from './city/CitizenStatsPopup';
+import { CitizenSpeechBubble } from './city/CitizenSpeechBubble';
 import { PropertyInfoPopup } from './city/PropertyInfoPopup';
+import { sendCitizenChat, initialChatState, type ChatState } from './city/citizenChat';
 
 
 export type CityRendererProps = {
@@ -63,6 +65,50 @@ export default function CityRenderer({
   useEffect(() => {
     for (const c of cityRef.current.all_citizens) {
       if (c !== selectedCitizen && c.visual_position) c.visual_position = undefined;
+    }
+  }, [selectedCitizen]);
+
+  // Citizen chat state — continuous within one selection. The history grows
+  // as the user asks follow-up questions; the API receives the full
+  // alternating user/assistant stream so the citizen has memory of prior
+  // turns. Reset whenever the selection changes.
+  const [chatState, setChatState] = useState<ChatState>(initialChatState);
+  const chatStateRef = useRef<ChatState>(initialChatState);
+  useEffect(() => { chatStateRef.current = chatState; }, [chatState]);
+  const chatAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    setChatState(initialChatState);
+    chatAbortRef.current?.abort();
+    chatAbortRef.current = null;
+  }, [selectedCitizen]);
+
+  const onSendChat = useCallback(async (question: string) => {
+    if (!selectedCitizen) return;
+    const trimmed = question.trim();
+    if (!trimmed) return;
+
+    chatAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    chatAbortRef.current = ctrl;
+
+    // Snapshot history BEFORE mutating state — we send these prior turns to
+    // the API and only commit the new turn to history on success.
+    const priorHistory = chatStateRef.current.history;
+    setChatState(s => ({ ...s, pending: true, error: null }));
+
+    try {
+      const reply = await sendCitizenChat(selectedCitizen, priorHistory, trimmed, ctrl.signal);
+      if (ctrl.signal.aborted) return;
+      setChatState(s => ({
+        history: [...s.history, { question: trimmed, reply }],
+        pending: false,
+        error: null,
+      }));
+    } catch (e) {
+      if (ctrl.signal.aborted) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      setChatState(s => ({ ...s, pending: false, error: msg }));
     }
   }, [selectedCitizen]);
 
@@ -344,11 +390,20 @@ export default function CityRenderer({
       {/* Stats popup for the selected citizen — citizens themselves are now
           rendered inside the Pixi scene (painter-sorted with properties). */}
       {selectedCitizen && (
-        <CitizenStatsPopup
-          citizen={selectedCitizen}
-          worldRef={worldRef}
-          onClose={() => setSelectedCitizen(null)}
-        />
+        <>
+          <CitizenStatsPopup
+            citizen={selectedCitizen}
+            worldRef={worldRef}
+            onClose={() => setSelectedCitizen(null)}
+            chatState={chatState}
+            onSendChat={onSendChat}
+          />
+          <CitizenSpeechBubble
+            citizen={selectedCitizen}
+            worldRef={worldRef}
+            chatState={chatState}
+          />
+        </>
       )}
 
       {/* Info popup for the selected property — shows live occupant list.

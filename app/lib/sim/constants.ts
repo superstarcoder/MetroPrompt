@@ -1,12 +1,12 @@
 // ============================================================
 // SIMULATION TIMING
-// 1 tick = 5 seconds real time = 1 hour in sim
-// 1 day = 24 ticks = 120 seconds real time
-// 7 days = 168 ticks = 14 minutes real time
+// 1 tick = 10 seconds real time = 1 hour in sim
+// 1 day = 24 ticks = 240 seconds real time (4 minutes)
+// 7 days = 168 ticks = 1680 seconds real time (28 minutes)
 // ============================================================
 
 export const SIMULATION = {
-  tick_interval_ms: 5000,
+  tick_interval_ms: 10000,
   hours_per_tick: 1,
   ticks_per_day: 24,
   total_days: 7,
@@ -17,6 +17,11 @@ export const SIMULATION = {
 // inside applies the property's full *_decrease values to that citizen's
 // needs, so 2 ticks at a 10-decrease building fully resets the relevant need.
 export const STAY_DURATION_TICKS = 2;
+
+// How many grid cells a citizen advances along their path per sim tick.
+// Visual lerp covers the full distance over the tick interval, so this also
+// scales walking speed proportionally (2 = 2x faster).
+export const WALK_CELLS_PER_TICK = 3;
 
 // ============================================================
 // RATE JITTER

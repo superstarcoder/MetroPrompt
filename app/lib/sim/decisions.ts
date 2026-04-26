@@ -73,14 +73,18 @@ export function isAtEntryTile(pos: { x: number; y: number }, p: Property): boole
 }
 
 // Picks a destination and computes the citizen's path to it. Mutates the
-// citizen in place: sets `current_path` AND `current_destination`. Tries
-// multiple candidates if the first pick is unreachable or yields a zero-length
-// walk (citizen already at the entry tile of the picked target — common when
-// they just arrived).
+// citizen in place: sets `current_path`, `current_destination`, and pushes a
+// new entry to `trips`. Tries multiple candidates if the first pick is
+// unreachable or yields a zero-length walk (citizen already at the entry tile
+// of the picked target — common when they just arrived).
+//
+// `currentTick` stamps the trip's `start_tick`. The corresponding
+// `arrived_tick` is set by useSimulation when the citizen enters the property.
 export function assignDestination(
   citizen: Person,
   city: City,
   walkability: boolean[][],
+  currentTick: number,
   maxAttempts = 8,
 ): void {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -104,6 +108,12 @@ export function assignDestination(
 
     citizen.current_path = firstSameAsCurrent ? path.slice(1) : path;
     citizen.current_destination = target;
+    citizen.trips.push({
+      destination_name: target.name,
+      destination_company: target.company_name,
+      start_tick: currentTick,
+      distance_tiles: citizen.current_path.length,
+    });
     return;
   }
   // Couldn't find a movable destination this tick — retry next tick.

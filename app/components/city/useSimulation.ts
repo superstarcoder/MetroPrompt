@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { RefObject } from 'react';
 import type { City, Person } from '@/lib/all_types';
 import { spawnInitialCitizens } from '@/lib/sim/spawning';
-import { SIMULATION, STAY_DURATION_TICKS, applyJitter } from '@/lib/sim/constants';
+import { SIMULATION, STAY_DURATION_TICKS, WALK_CELLS_PER_TICK, applyJitter } from '@/lib/sim/constants';
 import { buildWalkabilityGrid } from '@/lib/sim/pathfinding';
 import { assignDestination, isAtEntryTile } from '@/lib/sim/decisions';
 
@@ -73,16 +73,20 @@ export function useSimulation({
           c.inside_property = null;
           c.current_destination = undefined;
           c.stay_ticks_remaining = undefined;
-          if (walkability) assignDestination(c, city, walkability);
+          if (walkability) assignDestination(c, city, walkability, tickRef.current);
         } else {
           c.stay_ticks_remaining = remaining;
         }
         continue;
       }
 
-      // 4. Walking: advance one cell along the path.
+      // 4. Walking: advance up to WALK_CELLS_PER_TICK cells along the path.
+      // The visual lerp covers the full tick interval regardless, so this
+      // scales walking speed proportionally.
       if (c.current_path.length > 0) {
-        c.current_location = c.current_path.shift()!;
+        for (let i = 0; i < WALK_CELLS_PER_TICK && c.current_path.length > 0; i++) {
+          c.current_location = c.current_path.shift()!;
+        }
         // Arrived at end of path — try to enter the destination, or re-roll.
         if (c.current_path.length === 0) {
           const target = c.current_destination;
@@ -91,22 +95,27 @@ export function useSimulation({
               target.current_occupants.push(c.name);
               c.inside_property = target;
               c.stay_ticks_remaining = STAY_DURATION_TICKS;
+              // Stamp arrival on the most recent (in-progress) trip.
+              const lastTrip = c.trips[c.trips.length - 1];
+              if (lastTrip && lastTrip.arrived_tick === undefined) {
+                lastTrip.arrived_tick = tickRef.current;
+              }
             } else {
               // Full — try a different destination next tick.
               c.current_destination = undefined;
-              if (walkability) assignDestination(c, city, walkability);
+              if (walkability) assignDestination(c, city, walkability, tickRef.current);
             }
           } else {
             // Path ended without proper arrival (shouldn't normally happen).
             c.current_destination = undefined;
-            if (walkability) assignDestination(c, city, walkability);
+            if (walkability) assignDestination(c, city, walkability, tickRef.current);
           }
         }
         continue;
       }
 
       // 5. Idle: no path, not inside. Pick a destination.
-      if (walkability) assignDestination(c, city, walkability);
+      if (walkability) assignDestination(c, city, walkability, tickRef.current);
     }
 
     tickStartedAtRef.current = Date.now();
@@ -128,13 +137,13 @@ export function useSimulation({
     cityRef.current.all_citizens.length = 0;
     spawnInitialCitizens(cityRef.current);
     walkabilityRef.current = buildWalkabilityGrid(cityRef.current);
+    tickRef.current = 0;
     for (const c of cityRef.current.all_citizens) {
       c.prev_location = { ...c.current_location };
-      assignDestination(c, cityRef.current, walkabilityRef.current);
+      assignDestination(c, cityRef.current, walkabilityRef.current, tickRef.current);
     }
     setSelectedCitizen(null);
     setCitizensVersion(v => v + 1);
-    tickRef.current = 0;
     tickStartedAtRef.current = Date.now();
     setTick(0);
     setSimState('running');

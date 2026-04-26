@@ -2,8 +2,9 @@
 
 import { useEffect, useRef } from 'react';
 import type { RefObject } from 'react';
-import type { City, Property, PropertyName } from '@/lib/all_types';
+import type { City, Property } from '@/lib/all_types';
 import { gridToScreen } from './constants';
+import { PROPERTY_LABELS } from './propertyLabels';
 
 type Props = {
   property: Property;
@@ -11,22 +12,6 @@ type Props = {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   worldRef: RefObject<any>;
   onClose: () => void;
-};
-
-const PROPERTY_LABELS: Record<PropertyName, string> = {
-  park: 'Park',
-  hospital: 'Hospital',
-  school: 'School',
-  grocery_store: 'Grocery Store',
-  house: 'House',
-  apartment: 'Apartment',
-  office: 'Office',
-  restaurant: 'Restaurant',
-  fire_station: 'Fire Station',
-  police_station: 'Police Station',
-  power_plant: 'Power Plant',
-  shopping_mall: 'Shopping Mall',
-  theme_park: 'Theme Park',
 };
 
 export function PropertyInfoPopup({ property, cityRef, worldRef, onClose }: Props) {
