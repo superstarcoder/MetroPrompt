@@ -10,7 +10,6 @@ export const TILE_RENDER: Record<string, RenderOffset> = {
   pavement:          { offsetX: 0, offsetY: -19, scale: 1.2 },
   flower_patch_v1: { offsetX: 0, offsetY: -15, scale: 1.0 },
   bush_v1:         { offsetX: 0, offsetY: -15, scale: 1.0 },
-  // test:         { offsetX: 0, offsetY: -10, scale: 0.48 }, can be used for man
   tree_v1:         { offsetX: 0, offsetY: -32, scale: 1.2 },
   tree_v2:         { offsetX: 0, offsetY: -20, scale: 1.0 },
   tree_v3:         { offsetX: 0, offsetY: -20, scale: 1.0 },
@@ -44,4 +43,12 @@ export const PROP_RENDER: Record<string, RenderOffset> = {
   home_v4:       { offsetX: 0, offsetY: -28, scale: 1.15 },
   shopping_mall: { offsetX: 0, offsetY: -9, scale: 1 },
   theme_park:    { offsetX: 0, offsetY: -14, scale: 1 },
+};
+
+export const CITIZEN_RENDER: Record<string, RenderOffset> = {
+  man_front:                { offsetX: 0, offsetY: -10, scale: 0.48 },
+  man_walking_north_east_6: { offsetX: 0, offsetY: -10, scale: 0.48 },
+  man_walking_north_west_6: { offsetX: 0, offsetY: -10, scale: 0.48 },
+  man_walking_south_east_6: { offsetX: 0, offsetY: -10, scale: 0.48 },
+  man_walking_south_west_6: { offsetX: 0, offsetY: -10, scale: 0.48 },
 };

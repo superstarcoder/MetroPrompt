@@ -1,3 +1,10 @@
+import {
+  HUNGER_RATE_DISTRIBUTION,
+  BOREDOM_RATE_DISTRIBUTION,
+  TIREDNESS_RATE_DISTRIBUTION,
+  weightedNormal,
+} from "@/lib/sim/constants";
+
 // ============================================================
 // POSITION
 // ============================================================
@@ -65,6 +72,9 @@ export type Property = {
   hunger_decrease: number;    // 0–10
   tiredness_decrease: number; // 0–10
   image: string;
+  // Offices get a unique company name assigned at sim start; other property
+  // types leave this undefined.
+  company_name?: string;
 };
 
 export const HOUSE_IMAGES = [
@@ -109,6 +119,33 @@ export const FLOWER_PATCH_IMAGES = [
 
 export const BUSH_IMAGES = [
   "/assets/bush_v1_1_1.png",
+];
+
+// ============================================================
+// CITIZEN SPRITES
+// `man_front` is the idle / selected pose. Each walking direction is a 6-frame
+// PNG sequence (split from the original GIFs so Pixi can use them natively as
+// AnimatedSprite frames or via a global frame-index lookup).
+// ============================================================
+
+export const CITIZEN_IMAGE_FRONT = "/assets/characters/man_front.png";
+
+export const CITIZEN_FRAME_COUNT = 6;
+const framesFor = (dir: string): string[] =>
+  Array.from({ length: CITIZEN_FRAME_COUNT }, (_, i) =>
+    `/assets/characters/man_walking_${dir}_frame_${i + 1}.png`);
+
+export const CITIZEN_FRAMES_NE = framesFor("north_east");
+export const CITIZEN_FRAMES_NW = framesFor("north_west");
+export const CITIZEN_FRAMES_SE = framesFor("south_east");
+export const CITIZEN_FRAMES_SW = framesFor("south_west");
+
+export const CITIZEN_IMAGES = [
+  CITIZEN_IMAGE_FRONT,
+  ...CITIZEN_FRAMES_NE,
+  ...CITIZEN_FRAMES_NW,
+  ...CITIZEN_FRAMES_SE,
+  ...CITIZEN_FRAMES_SW,
 ];
 
 export const PROPERTY_DEFAULTS: Record<PropertyName, Omit<Property, "position" | "current_occupants">> = {
@@ -326,16 +363,10 @@ export const CODE_TO_PROPERTY: Record<string, PropertyName> = Object.fromEntries
 
 export type AgeGroup = "adult" | "child";
 
-export type Job =
-  | "teacher"
-  | "doctor"
-  | "firefighter"
-  | "police_officer"
-  | "chef"
-  | "grocer"
-  | "engineer"
-  | "unemployed"
-  | null; // null for children
+// Every adult is an engineer; the value of `Person.job` is the company name
+// (matching one of the offices' `company_name`). Children get `null`.
+// Display convention: "Engineer @ {job}".
+export type Job = string | null;
 
 export type Person = {
   name: string;
@@ -343,43 +374,60 @@ export type Person = {
   job: Job;
   home: Property;
   current_location: Position;
+  // Where the citizen was at the start of the current sim tick. Used by the
+  // renderer to lerp screen position smoothly between cells while still
+  // advancing the logical grid position one cell per tick.
+  prev_location?: Position;
+  // While selected by the user, the citizen freezes at the fractional
+  // (mid-lerp) position they were at when clicked, instead of snapping to
+  // current_location. Set in the Pixi click handler, cleared on deselect.
+  // Logical state (current_location, current_path) is unaffected.
+  visual_position?: Position;
   current_path: Position[];
   inside_property: Property | null;
+  // Where the citizen is currently heading (set by assignDestination, cleared
+  // on entry / leave). Used to detect arrival at an entry tile.
+  current_destination?: Property;
+  // Ticks remaining in the citizen's current property visit. Set on entry,
+  // counted down each tick while inside, triggers leave when ≤ 0.
+  stay_ticks_remaining?: number;
   hunger: number;           // 1–10
   boredom: number;          // 1–10
   tiredness: number;        // 1–10
-  hunger_rate: number;      // 1.5–4.5 per day
-  boredom_rate: number;     // 1.0–4.0 per day
-  tiredness_rate: number;   // 1.0–4.0 per day
+  hunger_rate: number;      // ~0.09–0.28 per tick (per hour); see HUNGER_RATE_DISTRIBUTION
+  boredom_rate: number;     // ~0.06–0.25 per tick (per hour); see BOREDOM_RATE_DISTRIBUTION
+  tiredness_rate: number;   // ~0.06–0.25 per tick (per hour); see TIREDNESS_RATE_DISTRIBUTION
   image: string;
 };
-
-export const JOB_OPTIONS: Exclude<Job, null>[] = [
-  "teacher",
-  "doctor",
-  "firefighter",
-  "police_officer",
-  "chef",
-  "grocer",
-  "engineer",
-  "unemployed",
-];
 
 export const randomBetween = (min: number, max: number): number =>
   Math.random() * (max - min) + min;
 
-declare function generateRandomName(): string;
+const FIRST_NAMES = [
+  "Alex", "Sam", "Jordan", "Casey", "Riley", "Morgan", "Taylor", "Jamie",
+  "Dana", "Pat", "Robin", "Drew", "Quinn", "Avery", "Reese", "Sage",
+  "Maya", "Owen", "Iris", "Leo", "Nora", "Kai", "Ezra", "Luna",
+  "Hugo", "Vera", "Theo", "Elena", "Felix", "Naomi", "Kira", "Otto",
+];
+
+const LAST_NAMES = [
+  "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis",
+  "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas",
+  "Patel", "Nguyen", "Kim", "Chen", "Singh", "Khan", "Cohen", "Reyes",
+];
+
+const generateRandomName = (): string =>
+  `${FIRST_NAMES[Math.floor(Math.random() * FIRST_NAMES.length)]} ${LAST_NAMES[Math.floor(Math.random() * LAST_NAMES.length)]}`;
 
 export const spawnPerson = (
   age_group: AgeGroup,
   home: Property,
-  availableImages: string[]
+  availableImages: string[],
+  job: Job = null,
 ): Person => ({
   name: generateRandomName(),
   age_group,
-  job: age_group === "adult"
-    ? JOB_OPTIONS[Math.floor(Math.random() * JOB_OPTIONS.length)]
-    : null,
+  job,
   home,
   current_location: home.position,
   current_path: [],
@@ -387,9 +435,9 @@ export const spawnPerson = (
   hunger: randomBetween(1.0, 4.0),
   boredom: randomBetween(1.0, 4.0),
   tiredness: randomBetween(1.0, 4.0),
-  hunger_rate: randomBetween(1.5, 4.5),
-  boredom_rate: randomBetween(1.0, 4.0),
-  tiredness_rate: randomBetween(1.0, 4.0),
+  hunger_rate: weightedNormal(HUNGER_RATE_DISTRIBUTION),
+  boredom_rate: weightedNormal(BOREDOM_RATE_DISTRIBUTION),
+  tiredness_rate: weightedNormal(TIREDNESS_RATE_DISTRIBUTION),
   image: availableImages[Math.floor(Math.random() * availableImages.length)],
 });
 

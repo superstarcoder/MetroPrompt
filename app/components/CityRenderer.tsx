@@ -3,14 +3,17 @@
 import Link from 'next/link';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { initCity } from '@/lib/all_types';
-import type { City } from '@/lib/all_types';
+import type { City, Person } from '@/lib/all_types';
 import { saveCity } from '@/lib/cityStore';
 import { GRID_SIZE } from './city/constants';
 import { useCityScene } from './city/useCityScene';
 import { useCityEditor } from './city/useCityEditor';
 import { useMayorSession } from './city/useMayorSession';
+import { useSimulation } from './city/useSimulation';
 import { ChatPanel, type SaveState } from './city/ChatPanel';
 import { Palette } from './city/Palette';
+import { CitizenStatsPopup } from './city/CitizenStatsPopup';
+import { PropertyInfoPopup } from './city/PropertyInfoPopup';
 
 
 export type CityRendererProps = {
@@ -45,8 +48,31 @@ export default function CityRenderer({
   const editor = useCityEditor({ cityRef, editable, onCityChange });
   const deleteBtnRef = useRef<HTMLButtonElement>(null);
 
+  // Citizen-selection state lives in CityRenderer so both useCityScene
+  // (clicks + render-side freeze) and useSimulation (skip movement on the
+  // selected citizen) can share it without a hook-order cycle.
+  const [selectedCitizen, setSelectedCitizen] = useState<Person | null>(null);
+  const selectedCitizenRef = useRef<Person | null>(null);
+  useEffect(() => { selectedCitizenRef.current = selectedCitizen; }, [selectedCitizen]);
+
+  // Whenever the selected citizen changes (or clears), drop any stale frozen
+  // visual_position from citizens that are no longer selected. The Pixi click
+  // handler clears the prior selection's visual_position when toggling
+  // directly between citizens; this catches the cases where setSelectedCitizen
+  // is called externally (popup ✕ button, sim stop, building click).
+  useEffect(() => {
+    for (const c of cityRef.current.all_citizens) {
+      if (c !== selectedCitizen && c.visual_position) c.visual_position = undefined;
+    }
+  }, [selectedCitizen]);
+
+  // Wall-clock timestamp of the last sim tick. useSimulation writes it each
+  // tick; useCityScene reads it for visual lerp.
+  const tickStartedAtRef = useRef<number>(0);
+
   // Pixi scene: owns app/world/layers, texture preload, painter loop, pan/zoom,
-  // click/drag/hover plumbing, and the floating delete-button anchor.
+  // click/drag/hover plumbing, the floating delete-button anchor, and citizen
+  // rendering (painter-sorted with properties + nature).
   const { scheduleRender, worldRef } = useCityScene({
     mountRef,
     cityRef,
@@ -58,12 +84,36 @@ export default function CityRenderer({
     entityDragRef: editor.entityDragRef,
     onCityChangeRef: editor.onCityChangeRef,
     setSelectedEntity: editor.setSelectedEntity,
+    selectedCitizenRef,
+    setSelectedCitizen,
+    tickStartedAtRef,
   });
 
   // Hand scheduleRender + worldRef back to the editor so its callbacks can use them.
   useEffect(() => {
     editor.bindScene({ scheduleRender, worldRef });
   }, [editor, scheduleRender, worldRef]);
+
+  // Citizen simulation. The hook drives a 5s tick loop while `running`,
+  // applying jittered need-decay per citizen + decision-making + movement.
+  // `tick` is consumed indirectly: calling useSimulation here subscribes
+  // CityRenderer to its internal state, which re-renders the stats popup
+  // with the latest values each tick.
+  const {
+    simState,
+    day,
+    hour,
+    startSim,
+    stopSim,
+    pauseSim,
+    resumeSim,
+  } = useSimulation({
+    cityRef,
+    scheduleRender,
+    selectedCitizenRef,
+    setSelectedCitizen,
+    tickStartedAtRef,
+  });
 
   // Save-city UI (only shown in the post-build `done` dock)
   const [saveName, setSaveName] = useState('');
@@ -247,6 +297,71 @@ export default function CityRenderer({
       >
         {showGrid ? '▣ hide grid' : '▢ show grid'}
       </button>
+
+      {/* Day / hour HUD — only while sim is active */}
+      {simState !== 'idle' && (
+        <div
+          data-mayor-ui
+          className="absolute top-4 left-1/2 -translate-x-1/2 px-4 py-2 bg-[#0b1220] text-white border-2 border-white/90 font-mono text-[11px] uppercase tracking-[0.2em] flex items-center gap-3"
+          style={{ boxShadow: '3px 3px 0 0 rgba(0,0,0,0.85)' }}
+        >
+          <span>Day <span className="text-fuchsia-300">{day}</span>/7</span>
+          <span className="opacity-40">·</span>
+          <span>Hour <span className="text-fuchsia-300">{hour}</span>/24</span>
+          {simState === 'paused' && <span className="ml-2 text-amber-300">▮▮ paused</span>}
+          {simState === 'done'   && <span className="ml-2 text-emerald-300">✓ complete</span>}
+        </div>
+      )}
+
+      {/* Simulation controls — pixel themed */}
+      <div data-mayor-ui className="absolute bottom-4 right-4 flex gap-2">
+        {(simState === 'running' || simState === 'paused') && (
+          <button
+            onClick={stopSim}
+            className="px-3 py-1.5 text-[10px] font-mono uppercase tracking-wider bg-[#0b1220] text-white border-2 border-white/90 hover:bg-[#1a2540] transition-colors"
+            style={{ boxShadow: '3px 3px 0 0 rgba(0,0,0,0.85)' }}
+          >
+            ■ stop
+          </button>
+        )}
+        <button
+          onClick={
+            simState === 'idle'    ? startSim  :
+            simState === 'running' ? pauseSim  :
+            simState === 'paused'  ? resumeSim :
+            startSim
+          }
+          className="px-3 py-1.5 text-[10px] font-mono uppercase tracking-wider bg-[#0b1220] text-white border-2 border-white/90 hover:bg-[#1a2540] transition-colors"
+          style={{ boxShadow: '3px 3px 0 0 rgba(0,0,0,0.85)' }}
+        >
+          {simState === 'idle'    && '▶ start simulation'}
+          {simState === 'running' && '⏸ pause'}
+          {simState === 'paused'  && '▶ resume'}
+          {simState === 'done'    && '↻ restart'}
+        </button>
+      </div>
+
+      {/* Stats popup for the selected citizen — citizens themselves are now
+          rendered inside the Pixi scene (painter-sorted with properties). */}
+      {selectedCitizen && (
+        <CitizenStatsPopup
+          citizen={selectedCitizen}
+          worldRef={worldRef}
+          onClose={() => setSelectedCitizen(null)}
+        />
+      )}
+
+      {/* Info popup for the selected property — shows live occupant list.
+          Available in any mode (the click-to-select gate was lifted in
+          useCityScene; only drag-to-move + delete remain edit-only). */}
+      {editor.selectedEntity?.kind === 'property' && (
+        <PropertyInfoPopup
+          property={editor.selectedEntity.data}
+          cityRef={cityRef}
+          worldRef={worldRef}
+          onClose={() => editor.setSelectedEntity(null)}
+        />
+      )}
     </div>
   );
 }

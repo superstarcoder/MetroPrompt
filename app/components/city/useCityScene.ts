@@ -3,15 +3,26 @@
 import { useCallback, useEffect, useRef } from 'react';
 import type { RefObject } from 'react';
 import { CODE_TO_TILE, TILE_META } from '@/lib/all_types';
-import type { City, Nature, Property } from '@/lib/all_types';
-import { PROP_RENDER, TILE_RENDER } from '@/lib/renderConfig';
+import type { City, Nature, Person, Property } from '@/lib/all_types';
+import { CITIZEN_RENDER, PROP_RENDER, TILE_RENDER } from '@/lib/renderConfig';
+import { SIMULATION } from '@/lib/sim/constants';
 import { GRID_SIZE, TILE_H, TILE_W, gridToScreen } from './constants';
 import {
   ALL_NATURE_IMAGES,
   ALL_PROP_IMAGES,
   ALL_TILE_IMAGES,
+  citizenDirection,
   renderKey,
 } from './imageHelpers';
+import {
+  CITIZEN_IMAGE_FRONT,
+  CITIZEN_FRAME_COUNT,
+  CITIZEN_FRAMES_NE,
+  CITIZEN_FRAMES_NW,
+  CITIZEN_FRAMES_SE,
+  CITIZEN_FRAMES_SW,
+} from '@/lib/all_types';
+import type { CitizenDirection } from './imageHelpers';
 import { entityAt, isPlacementValid, screenToGrid } from './hitTesting';
 import type { EntityDragState, SelectedEntity } from './hitTesting';
 
@@ -27,6 +38,10 @@ type Args = {
   entityDragRef: RefObject<EntityDragState | null>;
   onCityChangeRef: RefObject<((city: City) => void) | undefined>;
   setSelectedEntity: (e: SelectedEntity | null) => void;
+  // Sim/citizens
+  selectedCitizenRef: RefObject<Person | null>;
+  setSelectedCitizen: (p: Person | null) => void;
+  tickStartedAtRef: RefObject<number>;
 };
 
 type Result = {
@@ -36,10 +51,32 @@ type Result = {
   worldRef: RefObject<any>;
 };
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyTex = any;
+
+// Maps a walking direction to its 6-frame PNG sequence (split from the
+// original GIFs for native Pixi support).
+const CITIZEN_FRAMES_BY_DIR: Record<Exclude<CitizenDirection, 'idle'>, string[]> = {
+  NE: CITIZEN_FRAMES_NE,
+  NW: CITIZEN_FRAMES_NW,
+  SE: CITIZEN_FRAMES_SE,
+  SW: CITIZEN_FRAMES_SW,
+};
+
+// Walking-cycle frame duration in ms. ~125ms gives ~8 frames/sec, a natural
+// step pace. All same-direction citizens animate in sync — derived from
+// `Date.now()` rather than per-citizen state.
+const CITIZEN_FRAME_DURATION_MS = 125;
+
 // Owns the Pixi.js scene: app/world/layers, texture preload, the painter loop
 // (`scheduleRender`), pan/zoom, edit-mode hover/click/drag pointer plumbing,
-// and the floating delete-button anchor. Knows nothing about the agent SSE
-// stream or the chat panel — citizens / simulation will plug in here later.
+// the floating delete-button anchor, AND citizen rendering (painter-sorted with
+// properties + nature so depth-based occlusion works).
+//
+// Citizens use a canvas-snapshot trick for GIF animation: hidden DOM <img>
+// elements animate the source GIFs natively, an offscreen canvas redraws the
+// current frame each Pixi tick via drawImage, and Pixi sources its texture
+// from the canvas. Five textures total (one per direction + idle PNG).
 export function useCityScene({
   mountRef,
   cityRef,
@@ -51,50 +88,64 @@ export function useCityScene({
   entityDragRef,
   onCityChangeRef,
   setSelectedEntity,
+  selectedCitizenRef,
+  setSelectedCitizen,
+  tickStartedAtRef,
 }: Args): Result {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const pixiModRef = useRef<any>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const worldRef = useRef<any>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const spritesLayerRef = useRef<any>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const highlightLayerRef = useRef<any>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const appRef = useRef<any>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const tileTexRef = useRef<Record<string, any>>({});
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const propTexRef = useRef<Record<string, any>>({});
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const natureTexRef = useRef<Record<string, any>>({});
+  const pixiModRef = useRef<AnyTex>(null);
+  const worldRef = useRef<AnyTex>(null);
+  const spritesLayerRef = useRef<AnyTex>(null);
+  const highlightLayerRef = useRef<AnyTex>(null);
+  const appRef = useRef<AnyTex>(null);
+  const tileTexRef = useRef<Record<string, AnyTex>>({});
+  const propTexRef = useRef<Record<string, AnyTex>>({});
+  const natureTexRef = useRef<Record<string, AnyTex>>({});
+  // Citizen textures. `idle` is the static front PNG. Each walking direction
+  // is an array of 6 frame textures cycled by global Date.now()-derived index.
+  const citizenIdleTexRef = useRef<AnyTex>(null);
+  const citizenFrameTexRef = useRef<Record<Exclude<CitizenDirection, 'idle'>, AnyTex[]>>({
+    NE: [], NW: [], SE: [], SW: [],
+  });
+  // Bounding boxes of rendered citizen sprites in screen coords, captured each
+  // doRender. Used by the mount-level pointerdown handler to detect citizen
+  // clicks before falling through to the panning gesture.
+  const citizenHitsRef = useRef<Array<{ citizen: Person; left: number; top: number; right: number; bottom: number }>>([]);
   const texturesReadyRef = useRef(false);
   const rafHandleRef = useRef<number | null>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const gridLinesRef = useRef<any>(null);
+  const gridLinesRef = useRef<AnyTex>(null);
 
   const doRender = useCallback(() => {
     const mod = pixiModRef.current;
     const spritesLayer = spritesLayerRef.current;
     const highlightLayer = highlightLayerRef.current;
-    if (!mod || !spritesLayer || !texturesReadyRef.current) return;
+    const world = worldRef.current;
+    if (!mod || !spritesLayer || !world || !texturesReadyRef.current) return;
     const { Sprite } = mod;
     const city = cityRef.current;
     const tileTex = tileTexRef.current;
     const propTex = propTexRef.current;
     const natureTex = natureTexRef.current;
+    const citizenIdleTex = citizenIdleTexRef.current;
+    const citizenFrameTex = citizenFrameTexRef.current;
+    // Global walking-cycle frame index — all same-direction citizens use the
+    // same frame each render, so the loop stays cheap.
+    const animFrame = Math.floor(Date.now() / CITIZEN_FRAME_DURATION_MS) % CITIZEN_FRAME_COUNT;
     const drag = entityDragRef.current;
     const dragEntity = drag?.sel.data ?? null;
     const hovered = hoveredEntityRef.current;
     const selected = selectedEntityRef.current;
+    const selectedCitizen = selectedCitizenRef.current;
+
+    // Lerp progress for citizen movement.
+    const tickStarted = tickStartedAtRef.current;
+    const elapsed = tickStarted > 0 ? Date.now() - tickStarted : Number.POSITIVE_INFINITY;
+    const progress = Math.max(0, Math.min(1, elapsed / SIMULATION.tick_interval_ms));
 
     spritesLayer.removeChildren();
     if (highlightLayer) highlightLayer.removeChildren();
+    citizenHitsRef.current.length = 0;
 
-    // Spawn a tinted copy of `srcSprite` into the topmost highlight layer.
-    // Uses screen blend so the underlying sprite shows through with a wash.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const addHighlightCopy = (srcSprite: any, tex: any, color: number, alpha: number) => {
+    const addHighlightCopy = (srcSprite: AnyTex, tex: AnyTex, color: number, alpha: number) => {
       if (!highlightLayer) return;
       const copy = new Sprite(tex);
       copy.anchor.copyFrom(srcSprite.anchor);
@@ -108,15 +159,15 @@ export function useCityScene({
     };
 
     const highlightFor = (entity: Property | Nature): { color: number; alpha: number } | null => {
-      if (drag) return null; // suppressed during drag — green/red tint on the sprite handles it
-      if (selected && selected.data === entity) return { color: 0xffff00, alpha: 0.55 }; // yellow
+      if (drag) return null;
+      if (selected && selected.data === entity) return { color: 0xffff00, alpha: 0.55 };
       if (hovered && hovered.data === entity && hovered.data !== selected?.data) {
-        return { color: 0xffffff, alpha: 0.4 }; // soft white
+        return { color: 0xffffff, alpha: 0.4 };
       }
       return null;
     };
 
-    // Pass 1 — tiles (ground layer).
+    // Pass 1 — tiles (ground layer; always behind everything else).
     for (let gy = 0; gy < GRID_SIZE; gy++) {
       for (let gx = 0; gx < GRID_SIZE; gx++) {
         const code = city.tile_grid[gy][gx];
@@ -129,23 +180,63 @@ export function useCityScene({
         const cfg = TILE_RENDER[tileName] ?? { offsetX: 0, offsetY: 0, scale: 1 };
         const sprite = new Sprite(tex);
         sprite.anchor.set(0.5, 0);
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        sprite.scale.set((TILE_W / (tex as any).width) * cfg.scale);
+        sprite.scale.set((TILE_W / tex.width) * cfg.scale);
         sprite.x = x + cfg.offsetX;
         sprite.y = y + cfg.offsetY;
         spritesLayer.addChild(sprite);
       }
     }
 
-    // Pass 2 — nature + properties, painter-sorted by (x + y) of anchor.
-    type Drawable = { kind: 'nature'; data: Nature } | { kind: 'property'; data: Property };
-    const drawables: Drawable[] = [
-      ...city.all_nature.map<Drawable>(n => ({ kind: 'nature', data: n })),
-      ...city.all_properties.map<Drawable>(p => ({ kind: 'property', data: p })),
-    ];
-    drawables.sort((a, b) =>
-      (a.data.position.x + a.data.position.y) - (b.data.position.x + b.data.position.y)
-    );
+    // Pass 2 — nature, properties, and citizens, painter-sorted by depth (x+y of anchor / lerped position).
+    type Drawable =
+      | { kind: 'nature'; data: Nature; depth: number }
+      | { kind: 'property'; data: Property; depth: number }
+      | { kind: 'citizen'; data: Person; depth: number; gx: number; gy: number; direction: CitizenDirection };
+
+    const drawables: Drawable[] = [];
+    for (const n of city.all_nature) {
+      drawables.push({ kind: 'nature', data: n, depth: n.position.x + n.position.y });
+    }
+    for (const p of city.all_properties) {
+      // Use the depth of the NE-most cell on the building's back (anchor) row
+      // rather than the anchor itself. Citizens on any row passing through
+      // the footprint then draw BEFORE the building, fixing the case where
+      // citizens at e.g. (anchor_x+2, anchor_y-1) were tying / beating the
+      // anchor depth and rendering on top of a building they should be behind.
+      drawables.push({
+        kind: 'property',
+        data: p,
+        depth: p.position.x + p.position.y + Math.max(p.width - 1, p.height - 1),
+      });
+    }
+    for (const c of city.all_citizens) {
+      // Citizens inside a property are not visible from the city — they
+      // reappear at the entry tile when their stay expires.
+      if (c.inside_property) continue;
+      const isSelected = c === selectedCitizen;
+      const prev = c.prev_location ?? c.current_location;
+      const cur = c.current_location;
+      let gx: number;
+      let gy: number;
+      let direction: CitizenDirection;
+      if (isSelected && c.visual_position) {
+        // Frozen at the mid-lerp position captured when the user clicked.
+        gx = c.visual_position.x;
+        gy = c.visual_position.y;
+        direction = 'idle';
+      } else if (isSelected) {
+        gx = cur.x;
+        gy = cur.y;
+        direction = 'idle';
+      } else {
+        gx = prev.x + (cur.x - prev.x) * progress;
+        gy = prev.y + (cur.y - prev.y) * progress;
+        direction = citizenDirection(prev, cur);
+      }
+      drawables.push({ kind: 'citizen', data: c, depth: gx + gy, gx, gy, direction });
+    }
+    drawables.sort((a, b) => a.depth - b.depth);
+
     for (const d of drawables) {
       if (d.kind === 'property') {
         const p = d.data;
@@ -166,8 +257,7 @@ export function useCityScene({
         spritesLayer.addChild(sprite);
         const hl = highlightFor(p);
         if (hl) addHighlightCopy(sprite, tex, hl.color, hl.alpha);
-      }
-      if (d.kind === 'nature') {
+      } else if (d.kind === 'nature') {
         const n = d.data;
         const tex = natureTex[n.image];
         if (!tex) continue;
@@ -175,8 +265,7 @@ export function useCityScene({
         const cfg = TILE_RENDER[renderKey(n.image)] ?? { offsetX: 0, offsetY: 0, scale: 1 };
         const sprite = new Sprite(tex);
         sprite.anchor.set(0.5, 0);
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        sprite.scale.set((TILE_W / (tex as any).width) * cfg.scale);
+        sprite.scale.set((TILE_W / tex.width) * cfg.scale);
         sprite.x = x + cfg.offsetX;
         sprite.y = y + cfg.offsetY;
         if (dragEntity === n) {
@@ -186,9 +275,41 @@ export function useCityScene({
         spritesLayer.addChild(sprite);
         const hl = highlightFor(n);
         if (hl) addHighlightCopy(sprite, tex, hl.color, hl.alpha);
+      } else if (d.kind === 'citizen') {
+        const c = d.data;
+        const tex = d.direction === 'idle'
+          ? citizenIdleTex
+          : (citizenFrameTex[d.direction]?.[animFrame] ?? citizenIdleTex);
+        if (!tex) continue;
+        const { x, y } = gridToScreen(d.gx, d.gy);
+        const cfg = CITIZEN_RENDER.man_front;
+        const sprite = new Sprite(tex);
+        sprite.anchor.set(0.5, 0);
+        sprite.scale.set((TILE_W / tex.width) * cfg.scale);
+        sprite.x = x + cfg.offsetX;
+        sprite.y = y + cfg.offsetY;
+        spritesLayer.addChild(sprite);
+        // Highlight the selected citizen with a yellow wash.
+        if (c === selectedCitizen) {
+          addHighlightCopy(sprite, tex, 0xffd700, 0.6);
+        }
+        // Capture screen-space bbox for the mount-level click handler. The
+        // sprite is in world coords; transform to screen.
+        const ws = world.scale.x;
+        const screenX = sprite.x * ws + world.x;
+        const screenY = sprite.y * ws + world.y;
+        const screenW = sprite.width * ws;
+        const screenH = sprite.height * ws;
+        citizenHitsRef.current.push({
+          citizen: c,
+          left:   screenX - screenW / 2,
+          top:    screenY,
+          right:  screenX + screenW / 2,
+          bottom: screenY + screenH,
+        });
       }
     }
-  }, [cityRef, entityDragRef, hoveredEntityRef, selectedEntityRef]);
+  }, [cityRef, entityDragRef, hoveredEntityRef, selectedEntityRef, selectedCitizenRef, tickStartedAtRef]);
 
   const scheduleRender = useCallback(() => {
     if (rafHandleRef.current != null) return;
@@ -227,16 +348,27 @@ export function useCityScene({
       mount.appendChild(app.canvas as HTMLCanvasElement);
       appRef.current = app;
 
-      // Preload every possible texture upfront.
+      // Citizen textures: idle PNG + 6-frame PNG sequences per walking direction.
+      // All loaded through Assets.load alongside the rest of the static pool.
+      const loadCitizenFrames = async (dir: Exclude<CitizenDirection, 'idle'>) => {
+        const paths = CITIZEN_FRAMES_BY_DIR[dir];
+        const textures = await Promise.all(paths.map(p => Assets.load(p)));
+        citizenFrameTexRef.current[dir] = textures;
+      };
+
       await Promise.all([
         ...ALL_TILE_IMAGES.map(async p => { tileTexRef.current[p] = await Assets.load(p); }),
         ...ALL_PROP_IMAGES.map(async p => { propTexRef.current[p] = await Assets.load(p); }),
         ...ALL_NATURE_IMAGES.map(async p => { natureTexRef.current[p] = await Assets.load(p); }),
+        (async () => { citizenIdleTexRef.current = await Assets.load(CITIZEN_IMAGE_FRONT); })(),
+        loadCitizenFrames('NE'),
+        loadCitizenFrames('NW'),
+        loadCitizenFrames('SE'),
+        loadCitizenFrames('SW'),
       ]);
       if (destroyed) { app.destroy(true); return; }
       texturesReadyRef.current = true;
 
-      // world > spritesLayer (cleared on re-render) + gridLines (persistent) + highlightLayer (topmost, tinted sprite copies)
       const world = new Container();
       const spritesLayer = new Container();
       world.addChild(spritesLayer);
@@ -265,24 +397,34 @@ export function useCityScene({
       gridLinesRef.current = gridLines;
       world.addChild(gridLines);
 
-      // Highlight layer — topmost so hover/selected tints overlay everything else.
       const highlightLayer = new Container();
       world.addChild(highlightLayer);
       highlightLayerRef.current = highlightLayer;
 
-      // Initial render (empty grass at this point).
       doRender();
 
-      // Pointer state. Two mutually exclusive gestures: panning (world drag)
-      // and entityDragging (move a selected property/nature). Edit-mode hover
-      // also runs in pointermove when no buttons are held.
+      // Pointer state.
       let panning = false;
       let entityDragging = false;
       let pointerStartX = 0, pointerStartY = 0;
       let panLastX = 0, panLastY = 0;
       let pointerDownDidHitEntity = false;
+      let pointerDownDidHitCitizen: Person | null = null;
       let pointerMoved = false;
       const CLICK_PIXEL_THRESHOLD = 4;
+
+      const hitTestCitizen = (sx: number, sy: number): Person | null => {
+        // Citizens are drawn in painter order (low depth → high depth). Iterate
+        // in reverse to return the visually top-most hit.
+        const hits = citizenHitsRef.current;
+        for (let i = hits.length - 1; i >= 0; i--) {
+          const h = hits[i];
+          if (sx >= h.left && sx <= h.right && sy >= h.top && sy <= h.bottom) {
+            return h.citizen;
+          }
+        }
+        return null;
+      };
 
       mount.addEventListener('pointerdown', (e) => {
         const target = e.target as HTMLElement;
@@ -292,10 +434,16 @@ export function useCityScene({
         pointerStartY = e.clientY;
         pointerMoved = false;
         pointerDownDidHitEntity = false;
+        pointerDownDidHitCitizen = null;
 
-        // Edit mode: if pointerdown lands on the currently-selected entity,
-        // start a drag-to-move instead of panning. A click that doesn't move
-        // (no drag distance) is treated as a no-op (still selected).
+        // Citizen click takes precedence over panning and entity drag.
+        const citizenHit = hitTestCitizen(e.clientX, e.clientY);
+        if (citizenHit) {
+          pointerDownDidHitCitizen = citizenHit;
+          mount.style.cursor = 'pointer';
+          return;
+        }
+
         if (editableRef.current && selectedEntityRef.current) {
           const sel = selectedEntityRef.current;
           const cell = screenToGrid(e.clientX, e.clientY, world.x, world.y, world.scale.x);
@@ -352,7 +500,6 @@ export function useCityScene({
           return;
         }
 
-        // Hover (no buttons pressed) — only meaningful in edit mode.
         if (editableRef.current && e.buttons === 0) {
           const cell = screenToGrid(e.clientX, e.clientY, world.x, world.y, world.scale.x);
           const hit = cell ? entityAt(cityRef.current, cell.gx, cell.gy) : null;
@@ -366,8 +513,43 @@ export function useCityScene({
       });
 
       const finishPointer = (e: PointerEvent) => {
-        // Palette drags handle their own cleanup with a dedicated window listener.
         if (entityDragRef.current?.isNew) return;
+
+        // Citizen-click resolution: a no-drag pointerdown+up on a citizen
+        // toggles their selection. Movement halts (handled by useSimulation
+        // reading selectedCitizenRef on each tick).
+        if (pointerDownDidHitCitizen && !pointerMoved) {
+          const c = pointerDownDidHitCitizen;
+          const prev = selectedCitizenRef.current;
+          // Clear any prior selection's frozen visual position.
+          if (prev && prev !== c && prev.visual_position) prev.visual_position = undefined;
+          if (prev === c) {
+            // Toggling off — citizen resumes normal lerp from current_location.
+            c.visual_position = undefined;
+            setSelectedCitizen(null);
+          } else {
+            // Selecting — capture the citizen's current mid-lerp position so
+            // they freeze in place rather than snapping to current_location.
+            const cPrev = c.prev_location ?? c.current_location;
+            const cCur = c.current_location;
+            const tickStarted = tickStartedAtRef.current;
+            const elapsed = tickStarted > 0 ? Date.now() - tickStarted : Number.POSITIVE_INFINITY;
+            const captureProgress = Math.max(0, Math.min(1, elapsed / SIMULATION.tick_interval_ms));
+            c.visual_position = {
+              x: cPrev.x + (cCur.x - cPrev.x) * captureProgress,
+              y: cPrev.y + (cCur.y - cPrev.y) * captureProgress,
+            };
+            setSelectedCitizen(c);
+          }
+          // Also clear any property selection so popups don't double up.
+          if (selectedEntityRef.current) setSelectedEntity(null);
+          pointerDownDidHitCitizen = null;
+          mount.style.cursor = 'grab';
+          scheduleRender();
+          return;
+        }
+        pointerDownDidHitCitizen = null;
+
         if (entityDragging && entityDragRef.current) {
           const drag = entityDragRef.current;
           if (!drag.valid) {
@@ -387,17 +569,20 @@ export function useCityScene({
           panning = false;
         }
 
-        // Treat a no-drag pointerdown+up as a click — toggle selection.
-        if (editableRef.current && !pointerMoved && !pointerDownDidHitEntity) {
+        // Click-to-select runs in any mode so the property info popup works
+        // outside edit mode too. Drag-to-move and the delete button remain
+        // edit-mode-only (gated above and in the parent JSX).
+        if (!pointerMoved && !pointerDownDidHitEntity) {
           const cell = screenToGrid(e.clientX, e.clientY, world.x, world.y, world.scale.x);
           const hit = cell ? entityAt(cityRef.current, cell.gx, cell.gy) : null;
           if (hit) {
-            // Toggle off if clicking the same selected entity.
             const sel = selectedEntityRef.current;
             if (sel?.data === hit.data) {
               setSelectedEntity(null);
             } else {
               setSelectedEntity(hit);
+              // Clear any selected citizen so two popups never coexist.
+              if (selectedCitizenRef.current) setSelectedCitizen(null);
             }
           } else {
             setSelectedEntity(null);
@@ -408,8 +593,6 @@ export function useCityScene({
         mount.style.cursor = 'grab';
       };
 
-      // Use window-level pointerup so dropping outside the canvas still completes
-      // the gesture cleanly (otherwise drag/pan can get stuck).
       window.addEventListener('pointerup', finishPointer);
       cleanupFns.push(() => window.removeEventListener('pointerup', finishPointer));
       mount.style.cursor = 'grab';
@@ -419,7 +602,6 @@ export function useCityScene({
         const btn = deleteBtnRef.current;
         if (!btn) return;
         const sel = selectedEntityRef.current;
-        // Hide while dragging or when nothing is selected.
         if (!sel || entityDragRef.current) {
           if (btn.style.display !== 'none') btn.style.display = 'none';
           return;
@@ -427,7 +609,6 @@ export function useCityScene({
         const pos = sel.data.position;
         const w = sel.kind === 'property' ? sel.data.width  : 1;
         const h = sel.kind === 'property' ? sel.data.height : 1;
-        // South vertex of the back-most cell of the footprint = visually below the entity.
         const lastCellX = pos.x + w - 1;
         const lastCellY = pos.y + h - 1;
         const grid = gridToScreen(lastCellX, lastCellY);
@@ -439,6 +620,17 @@ export function useCityScene({
       };
       app.ticker.add(repositionDeleteBtn);
       cleanupFns.push(() => app.ticker.remove(repositionDeleteBtn));
+
+      // Drive a per-frame repaint while citizens are alive — they need smooth
+      // sub-tick interpolation AND the global walking-frame index advances
+      // every CITIZEN_FRAME_DURATION_MS. Idle (no citizens) costs nothing.
+      const animateCitizensTick = () => {
+        if (cityRef.current.all_citizens.length > 0) {
+          scheduleRender();
+        }
+      };
+      app.ticker.add(animateCitizensTick);
+      cleanupFns.push(() => app.ticker.remove(animateCitizensTick));
 
       // Zoom toward cursor.
       mount.addEventListener('wheel', (e) => {
