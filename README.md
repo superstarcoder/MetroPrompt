@@ -2,7 +2,9 @@
 
 ### 🎥 **[Watch the demo video →](https://www.youtube.com/watch?v=lT5-Hm6LYc4)**
 
-An agentic, pixel-art city builder. The user describes a city in natural language; a **Mayor** agent plans the road grid, partitions the map, and delegates each region to a **Zone** sub-agent. Zones build in parallel, the city streams to the browser live over SSE, and Pixi.js renders it as isometric pixel art.
+MetroPrompt is an agentic pixel art city builder where AI agents collaboratively design and construct a city from your prompts alone. A planner agent and zone sub-agents work together to lay roads, place buildings, and grow neighborhoods in real time. Citizens with Claude-powered brains are spawned into the city, each with unique personalities, needs, and jobs that drive their daily behavior across a 7-day simulation.
+
+As AI agents grow more capable, MetroPrompt points toward a future where city planners can rapidly prototype urban layouts, stress-test infrastructure decisions, and observe emergent citizen behavior before a single brick is laid in the real world.
 
 Built for the *Claude Opus 4.7* hackathon over five days. Stack: Next.js 16 (App Router) · Pixi.js v8 · Anthropic Claude Managed Agents · TypeScript.
 
@@ -353,11 +355,3 @@ On first boot, agents and an environment are auto-created and their IDs are logg
 - Single-process demo: sessions live in a module-level Map; horizontal scaling would need an external store.
 - No SDK knob to disable extended thinking on Managed Agents; Haiku-on-Zone is the workaround.
 - Filename casing matters cross-platform: data files lowercase, components PascalCase.
-
----
-
-## Status
-
-Stages 1–12 complete: schema, rendering, Mayor, SSE, batch tools, Mayor+Zone fan-out, nature placement, chat UI, edits + follow-ups, robustness (tool ledger, Haiku swap), saved cities + edit mode, frontend hook refactor.
-
-Next up: 7-day citizen simulation (need decay, pathfinding, and a feedback loop that hands the simulation results back to the Mayor for a planning report).
