@@ -1,8 +1,12 @@
 # MetroPrompt
 
+### 🎥 **[Watch the demo video →](https://www.youtube.com/watch?v=lT5-Hm6LYc4)**
+
 An agentic, pixel-art city builder. The user describes a city in natural language; a **Mayor** agent plans the road grid, partitions the map, and delegates each region to a **Zone** sub-agent. Zones build in parallel, the city streams to the browser live over SSE, and Pixi.js renders it as isometric pixel art.
 
-Built for the *Build For What's Next* hackathon over five days. Stack: Next.js 16 (App Router) · Pixi.js v8 · Anthropic Claude Managed Agents · TypeScript.
+Built for the *Claude Opus 4.7* hackathon over five days. Stack: Next.js 16 (App Router) · Pixi.js v8 · Anthropic Claude Managed Agents · TypeScript.
+
+![MetroPrompt](thumbnail.png)
 
 ---
 
