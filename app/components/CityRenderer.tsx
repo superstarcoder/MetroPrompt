@@ -15,6 +15,7 @@ import { ChatPanel, type SaveState } from './city/ChatPanel';
 import { Palette } from './city/Palette';
 import { CitizenStatsPopup } from './city/CitizenStatsPopup';
 import { CitizenSpeechBubble } from './city/CitizenSpeechBubble';
+import { SimulationReport } from './city/SimulationReport';
 import { useCitizenVoice } from './city/useCitizenVoice';
 import { PropertyInfoPopup } from './city/PropertyInfoPopup';
 import { ResponseTimePopup } from './city/ResponseTimePopup';
@@ -163,14 +164,17 @@ export default function CityRenderer({
     simState,
     day,
     hour,
+    tick,
     startSim,
     stopSim,
+    endSim,
     pauseSim,
     resumeSim,
     fireTruckActive,
     dispatchFireTruck,
     responseReport,
     dismissResponseReport,
+    fireLog,
   } = useSimulation({
     cityRef,
     scheduleRender,
@@ -179,6 +183,18 @@ export default function CityRenderer({
     tickStartedAtRef,
     activeFireTruckRef,
   });
+
+  // End-of-run report. Opened by "end simulation", which freezes the sim
+  // WITHOUT clearing citizens (stopSim would wipe the very data it shows).
+  // Holding the City here rather than reading cityRef during render keeps the
+  // ref access inside an event handler. It's the same mutable object either
+  // way — the sim is frozen by the time this is set, so nothing changes under it.
+  const [reportCity, setReportCity] = useState<City | null>(null);
+  const onEndSimulation = useCallback(() => {
+    endSim();
+    setSelectedCitizen(null);
+    setReportCity(cityRef.current);
+  }, [endSim]);
 
   // Save-city UI (only shown in the post-build `done` dock)
   const [saveName, setSaveName] = useState('');
@@ -381,12 +397,37 @@ export default function CityRenderer({
       {/* Simulation controls — pixel themed */}
       <div data-mayor-ui className="absolute bottom-4 right-4 flex gap-2">
         {(simState === 'running' || simState === 'paused') && (
+          <>
+            {/* Resets to idle and clears citizens. */}
+            <button
+              onClick={stopSim}
+              title="Discard this run and return to editing"
+              className="px-3 py-1.5 text-[10px] font-mono uppercase tracking-wider bg-[#0b1220] text-white/70 border-2 border-white/50 hover:bg-[#1a2540] hover:text-white transition-colors"
+              style={{ boxShadow: '3px 3px 0 0 rgba(0,0,0,0.85)' }}
+            >
+              ■ reset
+            </button>
+            {/* Freezes the run and opens the report — citizens are preserved. */}
+            <button
+              onClick={onEndSimulation}
+              title="End the run and review what every citizen experienced"
+              className="px-3 py-1.5 text-[10px] font-mono uppercase tracking-wider bg-fuchsia-700 text-white border-2 border-white/90 hover:bg-fuchsia-600 transition-colors"
+              style={{ boxShadow: '3px 3px 0 0 rgba(0,0,0,0.85)' }}
+            >
+              ⏹ end simulation
+            </button>
+          </>
+        )}
+        {/* 'done' means the run finished with citizens intact — either the
+            user ended it or it hit total_ticks. Either way the report is
+            still reachable after closing it. */}
+        {simState === 'done' && !reportCity && (
           <button
-            onClick={stopSim}
+            onClick={() => setReportCity(cityRef.current)}
             className="px-3 py-1.5 text-[10px] font-mono uppercase tracking-wider bg-[#0b1220] text-white border-2 border-white/90 hover:bg-[#1a2540] transition-colors"
             style={{ boxShadow: '3px 3px 0 0 rgba(0,0,0,0.85)' }}
           >
-            ■ stop
+            ⊞ report
           </button>
         )}
         <button
@@ -460,6 +501,21 @@ export default function CityRenderer({
           elapsedMs={responseReport.elapsedMs}
           targetName={responseReport.targetName}
           onClose={dismissResponseReport}
+        />
+      )}
+
+      {/* End-of-run report. Full-screen, above everything else. */}
+      {reportCity && (
+        <SimulationReport
+          city={reportCity}
+          day={day}
+          tick={tick}
+          fireLog={fireLog}
+          // Saved cities carry a name; an unsaved one may still have a name
+          // typed into the save box. Null means genuinely unnamed, and the
+          // Mayor is told to just say "the city" rather than invent one.
+          cityName={cityName?.trim() || saveName.trim() || null}
+          onClose={() => setReportCity(null)}
         />
       )}
     </div>

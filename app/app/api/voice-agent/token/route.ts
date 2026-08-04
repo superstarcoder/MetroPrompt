@@ -56,6 +56,8 @@ export async function POST(req: Request): Promise<Response> {
     return Response.json({
       token: grant.access_token,
       expiresIn: grant.expires_in,
+      // Citizens are short, fast exchanges — Haiku keeps latency low.
+      model: 'claude-haiku-4-5',
       prompt: buildCitizenVoicePrompt(citizen),
       voice: pickCitizenVoice(citizen.name, citizen.gender),
       keyterms: citizenKeyterms(citizen),

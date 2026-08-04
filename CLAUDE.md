@@ -60,6 +60,7 @@ MetroPrompt/
         CitizenStatsPopup.tsx           -- selected-citizen needs + status panel
         PropertyInfoPopup.tsx           -- property details on click
         ResponseTimePopup.tsx           -- firetruck response-time readout
+        SimulationReport.tsx            -- end-of-run screen: fire log + per-citizen roster
     lib/
       all_types.tsx                     -- data schema (source of truth)
       cityStore.ts                      -- localStorage persistence
@@ -106,7 +107,7 @@ MetroPrompt/
 
 ## Agent Architecture
 
-Two-tier: **Mayor** (coordinator, `claude-sonnet-4-6`) + **Zone** sub-agents (specialists, `claude-haiku-4-5`). Zone uses Haiku because its task is constrained -- Sonnet burned 20k+ tokens deliberating on simple zone fills.
+Two-tier: **Mayor** (coordinator, `claude-opus-5`) + **Zone** sub-agents (specialists, `claude-haiku-4-5`). Zone uses Haiku because its task is constrained -- Sonnet burned 20k+ tokens deliberating on simple zone fills.
 
 ### Agent Runtimes (`MAYOR_RUNTIME` in `mayor.ts`)
 
@@ -129,10 +130,27 @@ The Mayor can run on either of two interchangeable runtimes. Both emit identical
 
 | Constant | Current | Notes |
 |---|---|---|
-| `MAYOR_MODEL` | `claude-sonnet-4-6` | Chosen, not a placeholder. See the warning at the constant before changing it. |
+| `MAYOR_MODEL` | `claude-opus-5` | Read the warning at the constant before changing it or `MAYOR_THINKING`. |
 | `MAYOR_RUNTIME` | `'direct'` | `'managed'` is a one-line revert. |
-| `MAYOR_THINKING` | `'off'` | Direct runtime only. **The single biggest latency lever.** |
-| `MAYOR_EFFORT` | `'medium'` | `low`/`medium`/`high`/`max` on Sonnet 4.6. Haiku 4.5 rejects `effort` -- don't set it on Zones. |
+| `MAYOR_THINKING` | `'adaptive'` | Direct runtime only. **Must stay on under Opus 5** -- see below. |
+| `MAYOR_EFFORT` | `'low'` | Now the primary cost/latency lever, since thinking can't be switched off. `low`/`medium`/`high`/`xhigh`/`max` on Opus 5. Haiku 4.5 rejects `effort` -- don't set it on Zones. |
+
+**Why thinking can't be turned off any more.** Opus-5-generation models have a
+documented failure mode with `thinking: disabled`: a tool call gets written into
+the **visible text** instead of emitted as a `tool_use` block. The turn succeeds,
+the call silently never runs, no error is raised, and the stray text poisons
+later turns. A build loop that is nothing but tool calls (up to 70 per build) is
+the worst place for it -- the Mayor would appear to work and build nothing. Cost
+and latency are controlled with `MAYOR_EFFORT` instead; `low` is documented as
+unusually strong on Opus 5.
+
+Also fixed on this generation: `temperature` / `top_p` / `top_k` are rejected
+outright (400). The direct loop has never sent them -- keep it that way.
+
+**The `'off'` performance numbers below predate the model swap and no longer
+describe the shipped config** -- rerun `scripts/bench-mayor.mjs` before quoting
+them. Kept because the *attribution* they establish (thinking, not runtime, was
+the latency driver on Sonnet 4.6) is still the reason the direct runtime exists.
 | `MAYOR_PROMPT_VERSION` | `'v1'` | v1 long-form (~2,860 tok) / v2 condensed (~1,180 tok). Both live; flip to A/B. |
 
 ### Performance (50x50 build, fixed benchmark prompt)
@@ -298,7 +316,8 @@ When `editable={true}` (used by `/cities/[id]`):
 16. **Stage 2 -- Complete:** Deepgram **Voice Agent API** integration on citizen interviews. Full mic -> Flux STT -> Claude Haiku -> Aura-2 TTS -> speaker path with barge-in, plus a live output visualizer. See Voice Architecture below.
 17. **Stage 3:** live formal interview with the Mayor about citizen feedback and future plans.
     - **Prereq A -- Complete:** ground citizens in a concrete world (see Citizen Grounding below).
-    - **Prereq B -- Next:** log *failed* wants. `pickDestination` returns null when nothing is reachable and records nothing, so "I got hungry and there was nowhere to go" is still invisible. Then aggregate citizen feedback for the Mayor.
+    - **Prereq B -- Complete:** log *failed* wants (`Person.unmet_wants`, see Unmet Wants below).
+    - **Next:** aggregate citizen feedback for the Mayor, then the interview itself.
 18. **Stage 4:** talk to the Mayor live while it builds -- narration of tool calls, mute/unmute, barge-in wired to the interrupt path.
 
 **Deferred:** report generation, stream reconnect, per-zone interrupt, cross-playthrough memory, moving Zones onto the direct runtime (~47% of remaining build wall time).
@@ -330,17 +349,109 @@ consistent; start a new one and they may have a different job title. Fix if it
 ever matters: derive stable anchors from the name hash, the same trick
 `pickCitizenVoice` uses.
 
+## Unmet Wants (`Person.unmet_wants`)
+
+A trip that never happened leaves no trace in `trips`, so the sim used to
+discard its most planner-relevant signal. `assignDestination` now records two
+distinct failures, each **deduped by (need, reason) with a counter** -- idle
+citizens re-decide every tick, so appending per failure would bury the signal
+under hundreds of identical rows.
+
+| reason | meaning | what it tells the Mayor |
+|---|---|---|
+| `no_option` | need >= 7 and **nothing but their own home** serves it | build the missing amenity |
+| `unreachable` | destinations exist but every path attempt failed | fix the road/sidewalk network |
+
+Three calibration decisions, each of which was **dead code without it**:
+
+- **Home is excluded from `no_option`.** A house serves hunger 5 / boredom 2 /
+  tiredness 10, so counting it made the check always false. The planner
+  question isn't "can this person eat" but "does the city offer anywhere to eat".
+- **Tiredness is excluded entirely** (`PUBLIC_NEEDS`). Home gives
+  tiredness 10, more than a hospital's 5, so sleeping at home is correct rather
+  than a gap. Left in, it fired in every city without a hospital.
+- **Threshold of 7** (`UNMET_NEED_THRESHOLD`) -- below that it's a mild
+  preference, not a complaint.
+
+`unreachable` is rare **by design**: grass is walkable, so a citizen is only
+stuck if genuinely boxed in (e.g. ringed by road tiles, which are not
+walkable). That is exactly the "can't go anywhere" case, and it is verified to
+fire once with `trips: 0`.
+
+## End-of-Run Report (`SimulationReport.tsx`)
+
+Opened by **end simulation**, which calls `endSim()` -- distinct from `stopSim()`
+because **`stopSim` clears `all_citizens`**, destroying the trip log and unmet
+wants the report is built from. `endSim` moves to `'done'` (stopping the tick
+interval) and leaves the world frozen in place. A **⊞ report** button reopens it
+while the run is `done`.
+
+Split vertically: roster on the **left**, Mayor debrief reserved on the right.
+Left column, in one scroll view:
+
+1. **Fire log** -- every call with its property and response time, plus
+   average / fastest / slowest. `fireLog` lives in `useSimulation` (run-scoped,
+   *not* on `City` -- saving a city shouldn't carry a fire history), is appended
+   on arrival at the scene, and resets on `startSim`/`stopSim` but **not** on
+   `endSim`. Average shows `—` rather than `0.0s` when there were no fires.
+2. **Citizen cards**, two per row: identity, employer + what it does, needs
+   (amber at >=7, the unmet-want threshold), trip totals, most-visited places,
+   recent trips, and unmet wants.
+
+## The MAYOR_DEBRIEF Agent
+
+**A different agent from the build-phase Mayor** (`mayor.ts`). It has **no
+tools**, never touches the city, and its entire context is the finished
+simulation. Lives in `lib/agent/mayorDebriefPrompt.ts`; served by
+`/api/voice-agent/mayor-debrief-token`; driven by `useMayorDebriefVoice`.
+
+Role in the prompt: the Mayor talking to the **city planner** who built the
+place. Opens by thanking them, leads with a pattern then the evidence, always
+pairs a problem with a buildable fix, and is barred from inventing a resident,
+business, or statistic.
+
+| knob | value | why |
+|---|---|---|
+| model | `claude-sonnet-5` | see MODEL NOTE below |
+| thinking | off | opt-in on the Messages API; Deepgram never requests it, so its absence *is* the setting |
+| tools | none | no `functions` key is ever sent |
+| voice | `aura-2-apollo-en` | fixed, unlike citizens' name-hash pick |
+| turn length | **hard 60-word cap** | without it, replies ran 100+ words / ~40s of audio |
+
+**MODEL NOTE — Opus is not available.** `GET
+https://agent.deepgram.com/v1/agent/settings/think/models` returns exactly four
+Anthropic options: `claude-haiku-4-5`, `claude-sonnet-4-5`, `claude-sonnet-4-6`,
+`claude-sonnet-5`. **No Opus at any tier.** Reaching Opus would mean bypassing
+Deepgram's think provider -- either `think.endpoint` (a custom LLM URL
+Deepgram's servers must reach, so not localhost, and the key would ride in the
+browser's Settings message) or dropping to raw Listen + Speak sockets and owning
+the loop, forfeiting Deepgram's turn detection and barge-in. `claude-sonnet-5`
+is the most capable model actually reachable through the Voice Agent socket.
+
+The city name comes from the `cityName` prop (saved cities) or the save-box
+text; when genuinely unnamed the prompt tells the Mayor to say "the city"
+rather than invent one.
+
 ## Voice Architecture (Deepgram Voice Agent)
 
 Deepgram owns the entire speech loop -- STT, LLM, TTS, turn detection, and barge-in
 -- over one WebSocket. We only move audio in and out and mirror the state it reports.
 
 ```
-app/api/voice-agent/token/route.ts  -- mints a ~60s JWT + builds the persona payload
-lib/agent/citizenPrompt.ts          -- ONE persona source shared by voice + text chat
-components/city/useCitizenVoice.ts  -- browser socket, mic capture, playback, visualizer
-components/city/VoiceChatBar.tsx    -- button + status + 24-bar output visualizer
+components/city/useVoiceAgent.ts     -- THE transport: socket, mic, playback, reveal.
+                                    --  Shared by both agents; all protocol detail lives here.
+components/city/useCitizenVoice.ts   -- thin wrapper: citizen persona config
+components/city/useMayorDebriefVoice.ts -- thin wrapper: debrief report config
+app/api/voice-agent/token/route.ts   -- citizen: ~60s JWT + persona payload
+app/api/voice-agent/mayor-debrief-token/route.ts -- mayor: ~60s JWT + report payload
+lib/agent/citizenPrompt.ts           -- ONE persona source shared by voice + text chat
+lib/agent/mayorDebriefPrompt.ts      -- MAYOR_DEBRIEF prompt, model, voice
+components/city/VoiceChatBar.tsx     -- button + status + 24-bar output visualizer
 ```
+
+The two agents differ **only** in the config the server returns (`prompt`,
+`voice`, `keyterms`, `greeting`, `model`). Anything protocol-level belongs in
+`useVoiceAgent` so it can't drift between them.
 
 **The browser connects to Deepgram directly**, not through us: proxying a bidirectional
 audio stream through a route handler would add a hop to every 20ms frame in both

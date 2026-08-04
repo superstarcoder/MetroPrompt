@@ -55,27 +55,33 @@ function trimInfrastructureFromBbox(city: City, bbox: Bbox): Bbox | null {
 // ============================================================
 // MODEL
 // ============================================================
-// Sonnet 4.6 — fast, cheap, and with MAYOR_THINKING='off' it builds a 50x50
-// city in ~83s with no measurable quality loss. Not a placeholder; this is the
-// chosen model.
+// Opus 5. Previously Sonnet 4.6 + MAYOR_THINKING='off' (~83s for a 50x50).
 //
-// ⚠️ If you ever do change this: the Opus-5-generation models have a documented
-// failure mode with thinking disabled where a tool call is written into the
-// VISIBLE TEXT instead of emitted as a tool_use block — the turn succeeds, the
-// call silently never runs, and the stray text poisons later turns. It hits
-// tool-heavy loops like this one hardest. Swap MAYOR_THINKING to 'adaptive'
-// (with MAYOR_EFFORT='low') in the same edit, never the model alone.
-export const MAYOR_MODEL = 'claude-sonnet-4-6';
+// ⚠️ THINKING MUST STAY ON ('adaptive') ON THIS MODEL.
+// Opus-5-generation models have a documented failure mode with thinking
+// disabled: a tool call is written into the VISIBLE TEXT instead of emitted as
+// a tool_use block. The turn succeeds, the call silently never runs, no error
+// is raised, and the stray text poisons later turns. A build loop that is
+// nothing but tool calls is the worst possible place for it — the Mayor would
+// appear to work and build nothing. Cost/latency is controlled with
+// MAYOR_EFFORT instead; on Opus 5, 'low' is unusually strong.
+//
+// Also note for any future model swap: `temperature` / `top_p` / `top_k` are
+// rejected outright on this generation (400). This loop has never sent them —
+// keep it that way.
+export const MAYOR_MODEL = 'claude-opus-5';
 
-// Thinking depth. Managed Agents defaults to 'high', which on a cold build had
-// the Mayor spending ~90s and ~6.7k of its 7.8k output tokens on thinking before
-// the first tool call. Sonnet 4.6 accepts low | medium | high | max.
+// Thinking depth, and now the PRIMARY cost/latency lever — since thinking can't
+// be switched off on Opus 5 (see MAYOR_MODEL), this is what replaces it.
+// 'low' on Opus 5 is documented as unusually strong, so it's the starting point
+// rather than a compromise; raise it if build quality regresses.
+// Opus 5 accepts the full ladder: low | medium | high | xhigh | max.
 // NOTE: effort must live on the AGENT — an `effort` inside a per-session model
 // override is silently ignored. And if you change MAYOR_MODEL, always send
 // effort alongside it: on a model-id change an omitted effort resets to the new
 // model's default.
 // NOTE: Zone agents run Haiku 4.5, which rejects `effort` — don't mirror this there.
-export const MAYOR_EFFORT: 'low' | 'medium' | 'high' | 'max' = 'medium';
+export const MAYOR_EFFORT: 'low' | 'medium' | 'high' | 'xhigh' | 'max' = 'low';
 
 // Which system prompt the Mayor runs on. Both are defined below; flip this one
 // line to A/B them. v1 = original long-form (~2,860 tok), v2 = condensed
@@ -90,10 +96,13 @@ export const MAYOR_PROMPT_VERSION: 'v1' | 'v2' = 'v1';
 // Both emit identical MayorStreamEvents, so the frontend is unchanged.
 export const MAYOR_RUNTIME: 'managed' | 'direct' = 'direct';
 
-// Thinking mode — only honoured by the 'direct' runtime. Managed Agents has no
-// knob for this, which is the main reason the direct loop exists: on Sonnet 4.6
-// omitting `thinking` means no thinking at all, so 'off' is genuinely available.
-export const MAYOR_THINKING: 'adaptive' | 'off' = 'off';
+// Thinking mode — only honoured by the 'direct' runtime.
+//
+// ⚠️ 'off' IS NOT SAFE ON OPUS 5 — it silently turns tool calls into plain text
+// (see MAYOR_MODEL). It stays in the union only because flipping MAYOR_MODEL
+// back to a Sonnet-4.6-generation model makes it viable again; it is not a knob
+// to reach for while this model is set. Tune MAYOR_EFFORT instead.
+export const MAYOR_THINKING: 'adaptive' | 'off' = 'adaptive';
 
 // Output ceiling per turn for the direct loop. Generous because thinking tokens
 // count against it — the v1/high baseline spent 7.7k on turn one alone.
@@ -107,8 +116,18 @@ const MAX_CUSTOM_TOOL_USES = 70;
 // with the per-tool prose collapsed (the agent also receives TOOL_SCHEMAS as
 // real JSON schemas, so the <tools> block is a summary, not the contract).
 const MAYOR_SYSTEM_V2 = `<role>
-You are the Mayor of MetroPrompt, building a city on a 50×50 grid via tool calls. Build directly or delegate zones to sub-agents.
+You are the Mayor of MetroPrompt, building a city on a 50×50 grid via tool calls. You build through Zone sub-agents, and also hold every placement tool yourself.
 </role>
+
+<delegation_rule>
+Overrides any later text that sounds like delegation is optional.
+FIRST build of a session (empty grid, nothing delegated yet): you MUST make
+exactly one delegate_zones call — not optional, not skippable because building it
+yourself looks faster. Whole-city goal: 4-8 zones. Narrow goal: still delegate,
+1-3 zones over just that area. Lay roads + sidewalks yourself first.
+FOLLOW-UPS: delegation is optional and usually wrong — place directly, since
+delegate_zones rejects overlap with already-delegated territory.
+</delegation_rule>
 
 <grid>
 50×50, origin (0,0) top-left. Default terrain: grass.
@@ -151,15 +170,15 @@ finish(reason) — call exactly once per prompt to end your turn. Session persis
 <strategy_whole_city>
 1. PLAN: road grid + 4-8 zones, mentally, briefly. Don't narrate this in chat — go straight to tool calls.
 2. ROADS: one place_tile_rects call, all bands (typically 2 tiles wide).
-3. SIDEWALKS: one place_tile_rects call, both sides of each road + crosswalks at intersections.
-4. DELEGATE: one delegate_zones call, 4-8 zones sized 10-15 tiles. Per zone, give ONE short paragraph (2-4 sentences) covering: bbox edges that border roads, what's adjacent, building mix, and "add greenery, no empty patch >3x3." Skip elaborate multi-section templates — a tight paragraph outperforms a long one.
+3. SIDEWALKS: one place_tile_rects call, both sides of each road + crosswalks at intersections. Any tile crossing a road must be crosswalk, never sidewalk — crosswalk is the only walkable AND drivable tile, so a sidewalk over a road severs the network and blocks fire trucks.
+4. DELEGATE (MANDATORY on a first build — never place zone interiors yourself): one delegate_zones call, 4-8 zones sized 10-15 tiles. Per zone, give ONE short paragraph (2-4 sentences) covering: bbox edges that border roads, what's adjacent, building mix, and "add greenery, no empty patch >3x3." Skip elaborate multi-section templates — a tight paragraph outperforms a long one.
 5. Call finish().
 
 Defaults: center = commercial/office-heavy, outer = residential; distribute emergency services across zones, on roads; density gradient center→edge; pack tight (1-2 tile gaps); no empty area >3x3 unless requested.
 </strategy_whole_city>
 
 <strategy_partial>
-For a specific building/cluster/neighborhood: sketch briefly, adapt to existing state, use singleton/batch place tools directly. No delegate_zones.
+For a specific building/cluster/neighborhood on a FOLLOW-UP: sketch briefly, adapt to existing state, use singleton/batch place tools directly. No delegate_zones. (If the grid is still empty this is a first build — delegation_rule applies instead: delegate 1-3 zones over the requested area.)
 </strategy_partial>
 
 <strategy_edit>
@@ -172,8 +191,25 @@ Be concise. No pre-tool-call plan essays, no emoji-heavy headers. A one-line des
 
 // v1 — original long-form prompt.
 const MAYOR_SYSTEM_V1 = `<role>
-You are the Mayor of MetroPrompt. You coordinate city construction on a 50×50 grid by emitting tool calls. You can build directly or delegate regions to expert Zone Agents.
+You are the Mayor of MetroPrompt. You coordinate city construction on a 50×50 grid by emitting tool calls. You build through expert Zone Agents, and you also hold every placement tool yourself.
 </role>
+
+<delegation_rule>
+This overrides any later text that sounds like delegation is optional.
+
+FIRST build of a session (the grid starts empty, nothing has been delegated yet):
+you MUST make exactly one delegate_zones call. This is not optional, and not
+something to skip because you could place the buildings yourself. Zone Agents run
+in parallel and are the intended way the city gets built.
+  - Whole-city goal: 4-8 zones covering the map.
+  - Narrowly scoped goal (one neighborhood or amenity): still delegate, just use
+    1-3 zones covering only the requested area. Do not invent a whole city.
+Roads and sidewalks are still yours to lay first, before delegating.
+
+FOLLOW-UP prompts (anything after that first build): delegation is OPTIONAL and
+usually wrong. Use your own placement tools directly — delegate_zones rejects
+zones overlapping territory already delegated in this session.
+</delegation_rule>
 
 <grid>
 - Dimensions: 50 columns (x: 0–49) × 50 rows (y: 0–49)
@@ -293,9 +329,12 @@ STEP 2: ROADS
   Include all road bands (horizontal and vertical) in this one call.
 
 STEP 3: SIDEWALKS + CROSSWALKS
-  Lay 1-tile sidewalks on both sides of each road, plus optional crosswalks at intersections, in ONE place_tile_rects call.
+  Lay 1-tile sidewalks on both sides of each road, plus crosswalks at intersections, in ONE place_tile_rects call.
+  Any tile that CROSSES a road must be crosswalk, never sidewalk. Crosswalk is the only tile that is both walkable and drivable — a sidewalk laid over a road is not drivable, so it severs the road network and fire trucks cannot get through.
 
-STEP 4: DELEGATE ZONES
+STEP 4: DELEGATE ZONES — MANDATORY, NEVER SKIP
+  Per delegation_rule, a first build always delegates. Do not place the zone
+  interiors yourself, even if that seems faster or simpler.
   Call delegate_zones ONCE with the full list of zones. For each zone:
   - Write SPECIFIC, CREATIVE instructions
   - INCLUDE SPATIAL CONTEXT: which edges border roads (e.g. "main road on east edge at x=11-12, sidewalk on south at y=11"), and what neighboring zones contain ("commercial strip directly south, residential to the east"). Zones do NOT see the rest of the city.
@@ -348,11 +387,15 @@ POST-DELEGATION:
 </strategy_build_whole_city>
 
 <strategy_build_partial>
-Use this when asked to build a specific building, amenity, small cluster, neighborhood, or make improvements.
+Use this when asked to build a specific building, amenity, small cluster, neighborhood, or make improvements — on a FOLLOW-UP prompt, once a first build already exists.
 
 1. Sketch mentally before placing anything.
 2. Understand what has been done and what can be built around it — adapt to the current state.
 3. Use singleton tools (place_property, place_tile_rect) or their batch variants for targeted work.
+
+If the grid is still EMPTY, this is the first build, and delegation_rule applies
+instead — delegate 1-3 zones covering the requested area rather than placing it
+yourself.
 </strategy_build_partial>
 
 <strategy_edit>

@@ -23,6 +23,10 @@ export type CitizenContext = {
   current_property?: string;    // formatted label when status === 'inside'
   // Completed trips (arrived_tick set). distance_tiles is the path length.
   trips: Array<{ destination: string; distance: number }>;
+  // Times the citizen wanted something and couldn't act on it. This is the
+  // signal a city planner actually needs, and it's invisible in `trips` —
+  // a trip that never happened leaves no trace there.
+  unmet: Array<{ need: string; reason: 'no_option' | 'unreachable'; times: number }>;
 };
 
 const LONG_WALK_THRESHOLD = 50; // tiles — anything beyond this "feels long"
@@ -75,6 +79,26 @@ function summarizeTrips(trips: CitizenContext['trips']): string {
   ].join('\n');
 }
 
+// Phrased as lived experience, not as a data row: the citizen should say "I
+// was starving and there was nowhere to eat", not report a failure count.
+function summarizeUnmet(unmet: CitizenContext['unmet']): string | null {
+  if (unmet.length === 0) return null;
+  const felt: Record<string, string> = {
+    hunger: 'hungry',
+    boredom: 'bored',
+    tiredness: 'exhausted',
+  };
+  const lines = unmet.map(u => {
+    const what = felt[u.need] ?? u.need;
+    const why = u.reason === 'no_option'
+      ? 'there was nowhere in the city that could help'
+      : "you couldn't find a walkable route to anywhere that could help";
+    const often = u.times > 20 ? ' This keeps happening.' : '';
+    return `- You were ${what} and ${why}.${often}`;
+  });
+  return ['Times you wanted something and were stuck:', ...lines].join('\n');
+}
+
 function statusLine(c: CitizenContext): string {
   if (c.status === 'inside' && c.current_property) {
     return `Right now: inside ${c.current_property}.`;
@@ -86,6 +110,7 @@ function statusLine(c: CitizenContext): string {
 }
 
 export function buildCitizenSystemPrompt(c: CitizenContext): string {
+  const unmet = summarizeUnmet(c.unmet);
   return [
     `You are ${c.name}, a resident of a small city. Answer as them — first person, casual, human. You are not an assistant.`,
     '',
@@ -103,6 +128,7 @@ export function buildCitizenSystemPrompt(c: CitizenContext): string {
     statusLine(c),
     '',
     summarizeTrips(c.trips),
+    ...(unmet ? ['', unmet] : []),
     '',
     'HOW TO TALK:',
     '- Short. 25 words max, usually less. Fragments are fine.',
@@ -155,6 +181,7 @@ export function isCitizenContext(v: unknown): v is CitizenContext {
     typeof o.home_type === 'string' &&
     typeof o.needs === 'object' && o.needs !== null &&
     Array.isArray(o.trips) &&
+    Array.isArray(o.unmet) &&
     isDirectory(o.directory)
   );
 }

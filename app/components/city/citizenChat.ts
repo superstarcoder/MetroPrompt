@@ -36,6 +36,7 @@ export type CitizenChatContext = {
   current_destination?: string;
   current_property?: string;
   trips: Array<{ destination: string; distance: number }>;
+  unmet: Array<{ need: string; reason: 'no_option' | 'unreachable'; times: number }>;
 };
 
 // Everything the citizen knows about their own city: named businesses with
@@ -116,6 +117,11 @@ export function buildCitizenContext(c: Person, city: City): CitizenChatContext {
     current_destination,
     current_property,
     trips,
+    unmet: (c.unmet_wants ?? []).map(u => ({
+      need: u.need,
+      reason: u.reason,
+      times: u.count,
+    })),
   };
 }
 

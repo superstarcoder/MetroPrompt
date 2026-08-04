@@ -14,6 +14,7 @@ import {
 } from '@/lib/sim/firetruck';
 import { truckDirection } from './imageHelpers';
 import type { TruckDirection } from './imageHelpers';
+import { formatPropertyLabel } from './propertyLabels';
 
 export type SimState = 'idle' | 'running' | 'paused' | 'done';
 
@@ -49,6 +50,20 @@ export type FireTruck = {
 export type ResponseTimeReport = {
   elapsedMs: number;
   targetName: string;
+};
+
+// One completed emergency: where it burned and how long the truck took.
+// Appended on arrival at the scene, so a run that ends mid-response records
+// nothing — an unanswered call has no response time to report.
+//
+// Run-scoped rather than stored on City: this is what happened during a
+// playthrough, not part of the city's structure, and saving a city shouldn't
+// carry someone else's fire history along with it.
+export type FireRecord = {
+  label: string;      // "Sakura Ramen (Restaurant)" — named where possible
+  position: Position;
+  elapsedMs: number;
+  tick: number;
 };
 
 type Args = {
@@ -91,6 +106,7 @@ export function useSimulation({
   // gates UI (the 🔥 button hides while a truck is en route).
   const [fireTruckActive, setFireTruckActive] = useState(false);
   const [responseReport, setResponseReport] = useState<ResponseTimeReport | null>(null);
+  const [fireLog, setFireLog] = useState<FireRecord[]>([]);
   // Mirror simState into a ref so the rAF loop reads the latest value without
   // resubscribing every state change.
   const simStateRef = useRef<SimState>('idle');
@@ -245,10 +261,21 @@ export function useSimulation({
         truck.arrivedAtFireAt = now;
         truck.visualPosition = { ...path[path.length - 1] };
         // Surface the response-time report immediately on arrival.
+        const elapsedMs = now - truck.dispatchedAt;
         setResponseReport({
-          elapsedMs: now - truck.dispatchedAt,
+          elapsedMs,
           targetName: truck.target.name,
         });
+        // ...and keep it, so the end-of-run report can show every call.
+        setFireLog(log => [
+          ...log,
+          {
+            label: formatPropertyLabel(truck.target),
+            position: { ...truck.target.position },
+            elapsedMs,
+            tick: tickRef.current,
+          },
+        ]);
       } else {
         // Returned to station — despawn.
         activeFireTruckRef.current = null;
@@ -353,6 +380,7 @@ export function useSimulation({
   }, []);
 
   const startSim = useCallback(() => {
+    setFireLog([]);
     cityRef.current.all_citizens.length = 0;
     spawnInitialCitizens(cityRef.current);
     walkabilityRef.current = buildWalkabilityGrid(cityRef.current);
@@ -380,6 +408,7 @@ export function useSimulation({
   }, [cityRef, scheduleRender, setSelectedCitizen, tickStartedAtRef]);
 
   const stopSim = useCallback(() => {
+    setFireLog([]);
     cityRef.current.all_citizens.length = 0;
     walkabilityRef.current = null;
     drivabilityRef.current = null;
@@ -398,6 +427,22 @@ export function useSimulation({
     setSimState('idle');
     scheduleRender();
   }, [cityRef, scheduleRender, setSelectedCitizen, tickStartedAtRef, activeFireTruckRef]);
+
+  // Ends the run but KEEPS the citizens. Distinct from stopSim, which clears
+  // `all_citizens` — that would destroy the trip log and unmet-want records
+  // the end-of-run report is built from. Moving to 'done' stops the tick
+  // interval, so the world freezes exactly where the user left it.
+  const endSim = useCallback(() => {
+    activeFireTruckRef.current = null;
+    if (truckRafRef.current != null) {
+      cancelAnimationFrame(truckRafRef.current);
+      truckRafRef.current = null;
+    }
+    setFireTruckActive(false);
+    setResponseReport(null);
+    setSimState('done');
+    scheduleRender();
+  }, [activeFireTruckRef, scheduleRender]);
 
   const pauseSim = useCallback(() => {
     setSimState(s => (s === 'running' ? 'paused' : s));
@@ -422,6 +467,7 @@ export function useSimulation({
     citizensVersion,
     startSim,
     stopSim,
+    endSim,
     pauseSim,
     resumeSim,
     // Fire truck wiring
@@ -429,5 +475,6 @@ export function useSimulation({
     dispatchFireTruck,
     responseReport,
     dismissResponseReport,
+    fireLog,
   };
 }

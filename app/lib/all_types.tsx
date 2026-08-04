@@ -391,6 +391,24 @@ export type Trip = {
   arrived_tick?: number;
 };
 
+export type NeedName = "hunger" | "boredom" | "tiredness";
+
+// A want the citizen couldn't act on. Two distinct failures, because they mean
+// very different things to a city planner:
+//   no_option   -- nothing in the city serves this need at all. Build something.
+//   unreachable -- something exists, but no walkable route to it. Fix the roads.
+//
+// Deduped by (need, reason) and counted rather than appended per tick: idle
+// citizens re-decide EVERY tick, so appending would bury the signal under
+// thousands of identical rows within a single run.
+export type UnmetWant = {
+  need: NeedName;
+  reason: "no_option" | "unreachable";
+  first_tick: number;
+  last_tick: number;
+  count: number;
+};
+
 export type Person = {
   name: string;
   age_group: AgeGroup;
@@ -434,6 +452,9 @@ export type Person = {
   // Append-only trip log used by the chat endpoint. Pushed on assignDestination
   // success; arrived_tick stamped on entry. Initialized to [] at spawn.
   trips: Trip[];
+  // Wants the citizen couldn't act on. Optional: cities saved before this
+  // existed have citizens without it — read it as `c.unmet_wants ?? []`.
+  unmet_wants?: UnmetWant[];
 };
 
 export const randomBetween = (min: number, max: number): number =>
