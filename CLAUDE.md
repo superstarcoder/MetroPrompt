@@ -1,8 +1,8 @@
 # MetroPrompt -- Agentic City Builder
 
-Pixel-art city builder for a hackathon ("Build For What's Next"). User prompts a **Mayor agent** (Claude Managed Agents) which lays roads and partitions the grid, then delegates regions in parallel to **Zone sub-agents**. Build streams live via SSE. Future: 7-day citizen simulation + Mayor report.
+Pixel-art city builder, originally for a hackathon ("Build For What's Next"). User prompts a **Mayor agent** which lays roads and partitions the grid, then delegates regions in parallel to **Zone sub-agents**. Build streams live via SSE. A citizen simulation then runs on the finished city -- citizens have needs, pathfind to properties, and can be interviewed about their experience.
 
-**Timeline:** 4-day hackathon (started ~2026-04-22)
+**Timeline:** 4-day hackathon (started ~2026-04-22); ongoing development since. Current work: Deepgram voice integration (see Build Stages).
 
 ## Tech Stack
 
@@ -10,8 +10,8 @@ Pixel-art city builder for a hackathon ("Build For What's Next"). User prompts a
 |---|---|
 | Framework | Next.js 16 (App Router) -- see `app/AGENTS.md` for breaking changes |
 | Rendering | Pixi.js v8 (vanilla, dynamic import, nearest-neighbor scaling) |
-| Agents | Claude Managed Agents with custom tools (`agent.custom_tool_use` / `user.custom_tool_result`) |
-| Streaming | Two-layer SSE: Anthropic session stream -> Next.js route handler -> browser EventSource |
+| Agents | **Mayor: direct Messages API loop** (own the loop; see Agent Runtimes). Zones: Claude Managed Agents with custom tools |
+| Streaming | SSE: Next.js route handler -> browser EventSource (managed runtime adds an upstream Anthropic session stream) |
 | Chat rendering | `react-markdown` + `remark-gfm`, styles in `globals.css` under `.chat-md` |
 | Pixel art | PixelLab (AI-assisted isometric sprites) |
 
@@ -21,7 +21,8 @@ Pixel-art city builder for a hackathon ("Build For What's Next"). User prompts a
 MetroPrompt/
   assets/               -- pixel art sprites
   app/                  -- Next.js application
-    .env.local          -- ANTHROPIC_API_KEY, MAYOR_AGENT_ID, MAYOR_ENV_ID, ZONE_AGENT_ID
+    .env.local          -- ANTHROPIC_API_KEY (+ MAYOR_AGENT_ID / MAYOR_ENV_ID / ZONE_AGENT_ID,
+                        --  only used by the managed runtime; direct needs just the key)
     app/
       page.tsx          -- server component entry
       layout.tsx / globals.css
@@ -32,6 +33,7 @@ MetroPrompt/
           interrupt/route.ts            -- POST: halt session
           message/route.ts              -- POST: redirect (user.message)
           followup/route.ts             -- POST: queue follow-up goal
+      api/citizen-chat/route.ts         -- POST: interview a citizen (grounded in their trip log)
     components/
       CityRendererWrapper.tsx           -- 'use client', dynamic import w/ ssr:false
       CityRenderer.tsx                  -- 'use client', composes hooks + UI
@@ -45,16 +47,34 @@ MetroPrompt/
         useCityScene.ts                 -- Pixi app/world/layers, painter loop, pan/zoom, pointer events
         useCityEditor.ts               -- edit-mode: select/drag/delete entities, palette drag-to-place
         useMayorSession.ts             -- SSE stream, tool_applied -> city mutations, build/followup/pause/redirect
+        useSimulation.ts                -- sim tick driver: needs decay, movement, firetruck response
+        citizenChat.ts                  -- builds CitizenChatContext from a Person, calls /api/citizen-chat
+        propertyLabels.ts               -- display names for properties / trip destinations
         ChatPanel.tsx                   -- draggable/minimizable chat panel w/ feed + composer
         Palette.tsx                     -- building/nature thumbnail sidebar
+        CitizenSpeechBubble.tsx         -- citizen chat bubble (pending / reply / error)
+        CitizenStatsPopup.tsx           -- selected-citizen needs + status panel
+        PropertyInfoPopup.tsx           -- property details on click
+        ResponseTimePopup.tsx           -- firetruck response-time readout
     lib/
       all_types.tsx                     -- data schema (source of truth)
       cityStore.ts                      -- localStorage persistence
       renderConfig.ts                   -- per-sprite render offsets/scale
       agent/
         tools.ts                        -- tool schemas, handlers, applyToolCall, grass-only validation
-        mayor.ts                        -- Mayor agent: system prompt, session mgmt, runMayorLoop, delegate_zones
+        mayor.ts                        -- Mayor: prompts (v1/v2), config toggles, dispatchMayorTool,
+                                        --  runMayorLoop (managed) + runMayorLoopDirect, runMayorBuild
         zone.ts                         -- Zone agent: system prompt, runZoneBuild (bbox-enforced)
+        observation.ts                  -- city -> text observation for agents
+      sim/
+        constants.ts                    -- tick rates, need decay distributions, thresholds
+        spawning.ts                     -- populate a finished city with citizens
+        decisions.ts                    -- need-driven destination choice (pickDestination/assignDestination)
+        pathfinding.ts                  -- road/sidewalk-aware routing
+        companies.ts                    -- office employers
+        firetruck.ts                    -- emergency dispatch + response-time tracking
+    scripts/
+      bench-mayor.mjs                   -- headless build benchmark (POST /api/mayor + SSE, prints timings)
 ```
 
 ## SSR Pattern
@@ -82,6 +102,46 @@ MetroPrompt/
 ## Agent Architecture
 
 Two-tier: **Mayor** (coordinator, `claude-sonnet-4-6`) + **Zone** sub-agents (specialists, `claude-haiku-4-5`). Zone uses Haiku because its task is constrained -- Sonnet burned 20k+ tokens deliberating on simple zone fills.
+
+### Agent Runtimes (`MAYOR_RUNTIME` in `mayor.ts`)
+
+The Mayor can run on either of two interchangeable runtimes. Both emit identical `MayorStreamEvent`s, so **the frontend is unaffected by the choice**. `runMayorBuild()` dispatches; flipping the constant is the only change needed.
+
+| | `'managed'` | `'direct'` (current) |
+|---|---|---|
+| Loop | Anthropic runs it; we answer `agent.custom_tool_use` | We own it over `messages.stream()` |
+| Setup per build | `agents.create` / `environments.create` / `sessions.create` | none -- local UUID; config rides on each request |
+| Transcript | server-side session | `state.messages` in our own Map |
+| Thinking | **forced on, no knob** | per-request (`MAYOR_THINKING`) |
+| Effort | on the agent config | per-request `output_config.effort` |
+| Prompt caching | automatic | explicit `cache_control` (system + rolling history breakpoint) |
+
+**Zones always run on Managed Agents**, regardless of `MAYOR_RUNTIME`. In direct mode an environment is created lazily on first `delegate_zones`.
+
+`dispatchMayorTool()` holds *all* tool handling (batches, `delegate_zones`, singletons) and both runtimes call it, so the two paths provably execute the same logic.
+
+### Tuning knobs (all in `mayor.ts`, all logged in the `[bench]` header)
+
+| Constant | Current | Notes |
+|---|---|---|
+| `MAYOR_MODEL` | `claude-sonnet-4-6` | Chosen, not a placeholder. See the warning at the constant before changing it. |
+| `MAYOR_RUNTIME` | `'direct'` | `'managed'` is a one-line revert. |
+| `MAYOR_THINKING` | `'off'` | Direct runtime only. **The single biggest latency lever.** |
+| `MAYOR_EFFORT` | `'medium'` | `low`/`medium`/`high`/`max` on Sonnet 4.6. Haiku 4.5 rejects `effort` -- don't set it on Zones. |
+| `MAYOR_PROMPT_VERSION` | `'v1'` | v1 long-form (~2,860 tok) / v2 condensed (~1,180 tok). Both live; flip to A/B. |
+
+### Performance (50x50 build, fixed benchmark prompt)
+
+| runtime | thinking | first tool call | total output | total wall |
+|---|---|---|---|---|
+| managed | forced on, effort `high` | 105s | ~13.7k | 248s |
+| managed | forced on, effort `medium` | 49.9s | 13.2k | 222.8s |
+| direct | `adaptive` | 134s | 14.3k | 227.7s |
+| **direct** | **`off`** | **7.3s** | **3.0k** | **82.9s** |
+
+Owning the loop bought nothing by itself -- platform overhead measured at ~5% of wall time, and `direct + adaptive` matched managed. **The entire win came from disabling thinking**, which Managed Agents cannot express. Thinking was ~86% of output tokens on the old config. Quality (zone tiling, walkability, coverage) held at `thinking: off`.
+
+Measure with `node scripts/bench-mayor.mjs` (needs `npm run dev` running), or read the `[bench]` lines the server prints on any UI build. Keep the goal string identical across runs or the numbers stop comparing.
 
 ### Core Design Principles
 
@@ -112,11 +172,15 @@ Mayor has 14 tools; Zones have 7 (no `delegate_zones`, no `delete_*`).
 
 ### Re-entrant Sessions
 
-Sessions persist in a module-level Map after `finish`. Follow-up flow: `POST /followup` -> queues goal -> browser opens fresh EventSource on `/stream` -> `runMayorLoop` consumes queued goal. `completedZoneBboxes` preserved across follow-ups to prevent re-delegation.
+Sessions persist in a module-level Map after `finish`. Follow-up flow: `POST /followup` -> queues goal -> browser opens fresh EventSource on `/stream` -> the loop consumes the queued goal. `completedZoneBboxes` preserved across follow-ups to prevent re-delegation.
+
+Direct runtime: conversation history lives in `state.messages` and follow-ups append to it. `sendInterrupt` sets a flag checked at each turn boundary (the only safe stop point -- interrupting mid-turn would orphan a `tool_use` block); `sendRedirect` appends to the transcript if the loop is live, otherwise queues as `pendingGoal`.
 
 ### Environment Variables
 
-`ANTHROPIC_API_KEY`, `MAYOR_AGENT_ID`, `MAYOR_ENV_ID`, `ZONE_AGENT_ID`. Missing IDs trigger fresh `agents.create()` calls. **Drop ID(s) and restart when agent tools/system prompt/model changes** (agent config is immutable per version).
+`ANTHROPIC_API_KEY` is the only one the direct runtime needs. `MAYOR_AGENT_ID` / `MAYOR_ENV_ID` / `ZONE_AGENT_ID` apply to Managed Agents; missing IDs trigger fresh `agents.create()` / `environments.create()` calls.
+
+**You no longer drop the agent ID when the prompt or tools change.** `ensureMayor()` reconciles a pinned agent once per boot: it retrieves the current version and pushes the config from code as a new version. Updates are versioned and no-op when nothing changed, so this neither spams versions nor requires a restart. Pin `MAYOR_AGENT_ID` -- an unpinned ID means a brand-new agent object on every boot.
 
 ## Data Schema (`app/lib/all_types.tsx`)
 
@@ -216,14 +280,26 @@ When `editable={true}` (used by `/cities/[id]`):
 
 1-12: **Complete** -- schema, rendering, Mayor agent, SSE streaming, batch tools, multi-agent (Mayor+Zones), nature placement, chat UI, edit tools + follow-ups, robustness (tool ledger, Haiku swap), saved cities + edit mode, frontend refactor (god-component -> hooks)
 
-13. **Next:** 7-day citizen simulation (decay, pathfinding, feedback -> Mayor report)
-14. **Deferred:** report generation, stream reconnect, per-zone interrupt, cross-playthrough memory
+13. **Complete** -- citizen simulation: needs decay, road-aware pathfinding, companies/jobs, firetruck emergency response, per-citizen trip log, click-to-interview citizens (`/api/citizen-chat`)
+14. **Complete** -- agent loop performance: direct Messages API runtime, thinking/effort/prompt toggles, shared tool dispatch, benchmark harness (3x faster builds, 78% fewer tokens)
+
+### Deepgram voice branch (in progress)
+
+15. **Stage 1 -- Complete:** make the agent loop fast enough for real-time voice (above).
+16. **Stage 2 -- Next:** Deepgram **Voice Agent API** integration. Prove the mic -> STT -> LLM -> TTS -> speaker path with barge-in on the simplest surface first (citizen interviews already work end-to-end in text, have no tools in the loop, and return fast).
+17. **Stage 3:** live formal interview with the Mayor about citizen feedback and future plans. **Prerequisite (not voice work):** log *failed* wants -- `pickDestination` returns null when nothing is reachable and nothing is recorded, so "I got hungry and there was nowhere to go" is currently invisible. Then aggregate citizen feedback for the Mayor.
+18. **Stage 4:** talk to the Mayor live while it builds -- narration of tool calls, mute/unmute, barge-in wired to the interrupt path.
+
+**Deferred:** report generation, stream reconnect, per-zone interrupt, cross-playthrough memory, moving Zones onto the direct runtime (~47% of remaining build wall time).
 
 ## Known Limitations
 
 - No stream reconnect mid-build (server loop completes, can't re-attach)
-- Zone sessions not interruptible from UI
+- Zone sessions not interruptible from UI; Zones still run on Managed Agents
 - Single-user demo (module-level session Map, per-process)
-- Agent config changes require deleting `*_AGENT_ID` and restarting
-- No SDK knob to disable extended thinking on Managed Agents (model swap is the workaround)
+- Direct runtime interrupts land at turn boundaries, not mid-turn
 - Filename casing: data files lowercase, components PascalCase (cross-platform safety)
+
+**Resolved** (don't reintroduce these workarounds):
+- ~~No SDK knob to disable extended thinking~~ -- the direct runtime sets `thinking` per request. This was the single largest source of build latency.
+- ~~Agent config changes require deleting `*_AGENT_ID` and restarting~~ -- `ensureMayor()` reconciles via `agents.update()`.

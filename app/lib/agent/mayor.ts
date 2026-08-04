@@ -53,16 +53,125 @@ function trimInfrastructureFromBbox(city: City, bbox: Bbox): Bbox | null {
 }
 
 // ============================================================
-// MODEL SWAP — one line to flip for demo day.
+// MODEL
 // ============================================================
-// Sonnet 4.6 for iteration (fast, cheap). Flip to 'claude-opus-4-7' for demo.
+// Sonnet 4.6 — fast, cheap, and with MAYOR_THINKING='off' it builds a 50x50
+// city in ~83s with no measurable quality loss. Not a placeholder; this is the
+// chosen model.
+//
+// ⚠️ If you ever do change this: the Opus-5-generation models have a documented
+// failure mode with thinking disabled where a tool call is written into the
+// VISIBLE TEXT instead of emitted as a tool_use block — the turn succeeds, the
+// call silently never runs, and the stray text poisons later turns. It hits
+// tool-heavy loops like this one hardest. Swap MAYOR_THINKING to 'adaptive'
+// (with MAYOR_EFFORT='low') in the same edit, never the model alone.
 export const MAYOR_MODEL = 'claude-sonnet-4-6';
+
+// Thinking depth. Managed Agents defaults to 'high', which on a cold build had
+// the Mayor spending ~90s and ~6.7k of its 7.8k output tokens on thinking before
+// the first tool call. Sonnet 4.6 accepts low | medium | high | max.
+// NOTE: effort must live on the AGENT — an `effort` inside a per-session model
+// override is silently ignored. And if you change MAYOR_MODEL, always send
+// effort alongside it: on a model-id change an omitted effort resets to the new
+// model's default.
+// NOTE: Zone agents run Haiku 4.5, which rejects `effort` — don't mirror this there.
+export const MAYOR_EFFORT: 'low' | 'medium' | 'high' | 'max' = 'medium';
+
+// Which system prompt the Mayor runs on. Both are defined below; flip this one
+// line to A/B them. v1 = original long-form (~2,860 tok), v2 = condensed
+// (~1,180 tok, plans "mentally" and suppresses pre-tool-call prose).
+// Reported in the [bench] header so every run is self-labeling.
+export const MAYOR_PROMPT_VERSION: 'v1' | 'v2' = 'v1';
+
+// Which agent runtime drives the build.
+//   'managed' — Claude Managed Agents: Anthropic runs the loop, we answer
+//               custom_tool_use over a session stream. (original)
+//   'direct'  — we own the loop over plain Messages API streaming.
+// Both emit identical MayorStreamEvents, so the frontend is unchanged.
+export const MAYOR_RUNTIME: 'managed' | 'direct' = 'direct';
+
+// Thinking mode — only honoured by the 'direct' runtime. Managed Agents has no
+// knob for this, which is the main reason the direct loop exists: on Sonnet 4.6
+// omitting `thinking` means no thinking at all, so 'off' is genuinely available.
+export const MAYOR_THINKING: 'adaptive' | 'off' = 'off';
+
+// Output ceiling per turn for the direct loop. Generous because thinking tokens
+// count against it — the v1/high baseline spent 7.7k on turn one alone.
+const MAYOR_MAX_TOKENS = 32000;
 
 const AGENT_NAME = 'MetroPrompt Mayor';
 const ENV_NAME_PREFIX = 'metroprompt-env';
 const MAX_CUSTOM_TOOL_USES = 70;
 
-const MAYOR_SYSTEM = `<role>
+// v2 — condensed. Roughly a third the length of v1, same principles and rules,
+// with the per-tool prose collapsed (the agent also receives TOOL_SCHEMAS as
+// real JSON schemas, so the <tools> block is a summary, not the contract).
+const MAYOR_SYSTEM_V2 = `<role>
+You are the Mayor of MetroPrompt, building a city on a 50×50 grid via tool calls. Build directly or delegate zones to sub-agents.
+</role>
+
+<grid>
+50×50, origin (0,0) top-left. Default terrain: grass.
+</grid>
+
+<principles>
+Score/design against these. Priority when in conflict: Rules > Principles > Defaults.
+1. Walkability: grocery, park, restaurant within 20 tiles of every residence.
+2. 15-min city: all service types (grocery, school, hospital, park, restaurant) reachable within reasonable distance.
+3. Green space: parks scaled to population; no resident >20 tiles from a park.
+4. Emergency coverage: every residence within 25 tiles of a fire station AND hospital; both on roads, not buried mid-block.
+5. Mixed use: blend residential/commercial/civic per neighborhood; avoid single-use zones.
+6. Housing diversity: mix houses (low density) and apartments (high density); density increases toward center.
+7. Sequencing: roads/sidewalks before buildings; power/emergency before residential; every building must have road access; buffer power plant from residential.
+8. Separation: power plant never within 5 tiles of school/park/residential.
+</principles>
+
+<tools>
+place_property(property, x, y) / place_properties([...]) — anchor top-left, footprint down-right. 3×3: park, hospital, school, grocery_store, apartment, office, fire_station, police_station, power_plant, shopping_mall, theme_park. 2×2: house, restaurant. Prefer batch for 2+.
+
+place_tile_rect(tile, x1, y1, x2, y2) / place_tile_rects([...]) — fill rectangle, corners inclusive. Tiles: grass, pavement, road_one_way, road_two_way, road_intersection, crosswalk, sidewalk. Prefer batch for roads/sidewalks — lay full grid in one call.
+
+place_nature(nature, x, y) / place_natures([...]) — 1×1 tree/flower_patch/bush, grass only.
+
+delete_property(x, y) / delete_properties([...]) — any footprint cell works.
+delete_tile_rect(x1, y1, x2, y2) / delete_tile_rects([...]) — resets to grass, doesn't touch buildings/nature.
+delete_nature(x, y) / delete_natures([...])
+
+delegate_zones(zones: [{bbox: {x1, y1, x2, y2}, instructions}]) — hand regions to Zone sub-agents that run in parallel, each placing only inside its own bbox. Whole-city builds only, after roads + sidewalks are down; call once with all zones. Bboxes must fit in-grid (0-49 per axis), must not intersect each other, and must not intersect zones delegated earlier in this session.
+
+finish(reason) — call exactly once per prompt to end your turn. Session persists for follow-ups.
+</tools>
+
+<rules>
+1. Building footprints: no overlap with existing buildings; must fit in-bounds; every cell must be grass (not road/sidewalk/crosswalk/intersection/pavement).
+2. Nature: grass only.
+3. On tool error, read the coordinates and retry at a valid position.
+</rules>
+
+<strategy_whole_city>
+1. PLAN: road grid + 4-8 zones, mentally, briefly. Don't narrate this in chat — go straight to tool calls.
+2. ROADS: one place_tile_rects call, all bands (typically 2 tiles wide).
+3. SIDEWALKS: one place_tile_rects call, both sides of each road + crosswalks at intersections.
+4. DELEGATE: one delegate_zones call, 4-8 zones sized 10-15 tiles. Per zone, give ONE short paragraph (2-4 sentences) covering: bbox edges that border roads, what's adjacent, building mix, and "add greenery, no empty patch >3x3." Skip elaborate multi-section templates — a tight paragraph outperforms a long one.
+5. Call finish().
+
+Defaults: center = commercial/office-heavy, outer = residential; distribute emergency services across zones, on roads; density gradient center→edge; pack tight (1-2 tile gaps); no empty area >3x3 unless requested.
+</strategy_whole_city>
+
+<strategy_partial>
+For a specific building/cluster/neighborhood: sketch briefly, adapt to existing state, use singleton/batch place tools directly. No delegate_zones.
+</strategy_partial>
+
+<strategy_edit>
+For follow-ups editing/removing existing work: delete_* first (any footprint cell works for delete_property), then place_* after (delete_tile_rect first if ground isn't grass). Pure additions skip delete. No delegate_zones — it rejects overlap with prior zones. Call finish() when done.
+</strategy_edit>
+
+<output_style>
+Be concise. No pre-tool-call plan essays, no emoji-heavy headers. A one-line description before acting is enough; let the tool calls and a brief closing summary do the talking.
+</output_style>`;
+
+// v1 — original long-form prompt.
+const MAYOR_SYSTEM_V1 = `<role>
 You are the Mayor of MetroPrompt. You coordinate city construction on a 50×50 grid by emitting tool calls. You can build directly or delegate regions to expert Zone Agents.
 </role>
 
@@ -263,6 +372,8 @@ When principles conflict, prioritize: Rules (1st) > Urban Planning Principles (2
 <output_style>
 Be efficient. The city speaks for itself. No long explanations needed. Be concise!
 </output_style>`;
+// Active prompt — selected by MAYOR_PROMPT_VERSION above.
+const MAYOR_SYSTEM = MAYOR_PROMPT_VERSION === 'v1' ? MAYOR_SYSTEM_V1 : MAYOR_SYSTEM_V2;
 
 // ============================================================
 // SINGLETON CLIENT
@@ -283,8 +394,49 @@ function client(): Anthropic {
 let cachedAgentId: string | undefined = process.env.MAYOR_AGENT_ID;
 let cachedEnvId: string | undefined = process.env.MAYOR_ENV_ID;
 
+// Single source of truth for the agent config, shared by create and update so a
+// pinned MAYOR_AGENT_ID can't drift from what's in this file.
+function mayorAgentConfig() {
+  return {
+    name: AGENT_NAME,
+    model: { id: MAYOR_MODEL, effort: MAYOR_EFFORT },
+    system: MAYOR_SYSTEM,
+    tools: TOOL_SCHEMAS.map(s => ({ type: 'custom' as const, ...s })),
+  };
+}
+
+// Set once per process: whether we've reconciled a pinned agent this boot.
+let agentReconciled = false;
+
 export async function ensureMayor(): Promise<{ agentId: string; envId: string }> {
   if (cachedAgentId && cachedEnvId) {
+    // Agent came from .env.local, so its stored config is whatever it was when
+    // it was created — possibly an older model/effort/prompt. Push the current
+    // config once per boot. Updates are versioned and no-op when nothing
+    // changed, so this neither spams versions nor requires dropping the ID
+    // when the prompt or tools change.
+    if (!agentReconciled) {
+      agentReconciled = true;
+      try {
+        // SDK 0.91 requires `version` on update (optimistic concurrency), so
+        // read the current version first. Retrieve → update is also the
+        // recommended shape: a mismatch 409s instead of clobbering.
+        const current = await client().beta.agents.retrieve(cachedAgentId);
+        const updated = await client().beta.agents.update(cachedAgentId, {
+          version: current.version,
+          ...mayorAgentConfig(),
+        });
+        // Log the SERVER's echoed model config, not our local constant — this
+        // is the only thing that proves the effort setting actually landed.
+        console.log(
+          `[mayor] reconciled agent ${cachedAgentId} v${current.version} → v${updated.version} ` +
+          `· live model config: ${JSON.stringify(updated.model)}`
+        );
+      } catch (e) {
+        // Non-fatal: a stale config still builds cities. Surface and continue.
+        console.warn(`[mayor] agent reconcile failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
     return { agentId: cachedAgentId, envId: cachedEnvId };
   }
   const c = client();
@@ -300,14 +452,13 @@ export async function ensureMayor(): Promise<{ agentId: string; envId: string }>
   }
 
   if (!cachedAgentId) {
-    const agent = await c.beta.agents.create({
-      name: AGENT_NAME,
-      model: MAYOR_MODEL,
-      system: MAYOR_SYSTEM,
-      tools: TOOL_SCHEMAS.map(s => ({ type: 'custom' as const, ...s })),
-    });
+    const agent = await c.beta.agents.create(mayorAgentConfig());
     cachedAgentId = agent.id;
-    console.log(`[mayor] created agent ${cachedAgentId}`);
+    agentReconciled = true; // freshly created from the same config
+    console.log(
+      `[mayor] created agent ${cachedAgentId} ` +
+      `· live model config: ${JSON.stringify(agent.model)}`
+    );
   }
 
   console.log(
@@ -339,6 +490,10 @@ type SessionState = {
   // Bboxes of all zones the Mayor has previously delegated in THIS session.
   // Used to reject overlapping delegations on subsequent delegate_zones calls.
   completedZoneBboxes: Bbox[];
+  // Conversation history for the 'direct' runtime. Managed Agents keeps this
+  // server-side; when we own the loop we own the transcript, and follow-ups
+  // just append to it. Unused when MAYOR_RUNTIME === 'managed'.
+  messages: Anthropic.MessageParam[];
 };
 const sessions = new Map<string, SessionState>();
 
@@ -347,6 +502,24 @@ export function getSession(sessionId: string): SessionState | undefined {
 }
 
 export async function createMayorSession(goal: string): Promise<string> {
+  // DIRECT runtime: there is no server-side agent or session to provision —
+  // model, system prompt and tools all ride on each Messages request. Skip
+  // ensureMayor() entirely (no agents.create / environments.create /
+  // sessions.create round-trips) and mint a local id to key our own state on.
+  // Zones still need an env id, so resolve one lazily only if they delegate.
+  if (MAYOR_RUNTIME === 'direct') {
+    const localId = `local_${crypto.randomUUID()}`;
+    sessions.set(localId, {
+      city: initCity(50),
+      pendingGoal: goal,
+      running: false,
+      interrupted: false,
+      completedZoneBboxes: [],
+      messages: [],
+    });
+    return localId;
+  }
+
   const { agentId, envId } = await ensureMayor();
   const session = await client().beta.sessions.create({
     agent: agentId,
@@ -359,6 +532,7 @@ export async function createMayorSession(goal: string): Promise<string> {
     running: false,
     interrupted: false,
     completedZoneBboxes: [],
+    messages: [],
   });
   return session.id;
 }
@@ -370,6 +544,9 @@ export async function createMayorSession(goal: string): Promise<string> {
 export async function sendInterrupt(sessionId: string): Promise<void> {
   const s = sessions.get(sessionId);
   if (s) s.interrupted = true;
+  // Direct runtime: the flag IS the interrupt. runMayorLoopDirect checks it at
+  // each turn boundary, so there's no server-side session to notify.
+  if (MAYOR_RUNTIME === 'direct') return;
   await client().beta.sessions.events.send(sessionId, {
     events: [{ type: 'user.interrupt' }],
   });
@@ -389,6 +566,15 @@ export async function setFollowupGoal(sessionId: string, goal: string): Promise<
 export async function sendRedirect(sessionId: string, text: string): Promise<void> {
   const s = sessions.get(sessionId);
   if (s) s.interrupted = false;
+  // Direct runtime: append straight onto our own transcript. If the loop is
+  // still spinning it picks this up on the next turn; if it already exited,
+  // pendingGoal makes the next /stream open resume from here.
+  if (MAYOR_RUNTIME === 'direct') {
+    if (!s) throw new Error(`[mayor] unknown sessionId: ${sessionId}`);
+    if (s.running) s.messages.push({ role: 'user', content: text });
+    else s.pendingGoal = text;
+    return;
+  }
   await client().beta.sessions.events.send(sessionId, {
     events: [
       {
@@ -486,6 +672,259 @@ function bboxesIntersect(a: Bbox, b: Bbox): boolean {
   return a.x1 <= b.x2 && a.x2 >= b.x1 && a.y1 <= b.y2 && a.y2 >= b.y1;
 }
 
+// ============================================================
+// SHARED TOOL DISPATCH
+// ============================================================
+// Both runtimes funnel every Mayor tool call through here. Returns the text
+// that goes back to the model as a tool result, rather than posting it itself,
+// so the managed loop can wrap it in `user.custom_tool_result` and the direct
+// loop can wrap it in a `tool_result` content block.
+
+type DispatchOutcome = { text: string; isError: boolean; done?: boolean };
+
+// Zones still run on Managed Agents, so they need an environment. In direct
+// mode we never call ensureMayor(), so resolve one lazily on first delegation.
+async function ensureEnvIdForZones(): Promise<string> {
+  if (cachedEnvId) return cachedEnvId;
+  const env = await client().beta.environments.create({
+    name: `${ENV_NAME_PREFIX}-${Date.now()}`,
+    config: { type: 'cloud', networking: { type: 'unrestricted' } },
+  });
+  cachedEnvId = env.id;
+  console.log(`[mayor] created environment ${cachedEnvId} (lazy, for zones)`);
+  return cachedEnvId;
+}
+
+// Generic batch runner — every *_properties / *_rects / *_natures tool is
+// "apply the singleton N times, emit a synthetic per-item event, summarise".
+function runBatch<T>(
+  city: City,
+  toolUseId: string,
+  items: T[],
+  singleton: ToolCall['name'],
+  fmt: (item: T) => string,
+  verb: 'placed' | 'removed' | 'cleared',
+  onEvent: (e: MayorStreamEvent) => void,
+): DispatchOutcome {
+  let okCount = 0;
+  const failures: string[] = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const result = applyToolCall(city, {
+      name: singleton,
+      input: item,
+    } as ToolCall);
+    // Per-item synthetic event so the frontend renders progressively and reuses
+    // its existing singleton handler rather than needing a batch shape.
+    onEvent({
+      kind: 'tool_applied',
+      tool_use_id: `${toolUseId}#${i}`,
+      name: singleton,
+      input: item as unknown as Record<string, unknown>,
+      result,
+    });
+    if (result.ok) okCount++;
+    else failures.push(`[${i}] ${fmt(item)}: ${result.error}`);
+  }
+
+  return {
+    text:
+      failures.length === 0
+        ? `ok: all ${items.length} ${verb}`
+        : `partial: ${okCount}/${items.length} ${verb}\nfailed:\n${failures.join('\n')}`,
+    isError: failures.length > 0,
+  };
+}
+
+async function dispatchMayorTool(
+  state: SessionState,
+  toolUseId: string,
+  name: string,
+  input: Record<string, unknown>,
+  onEvent: (e: MayorStreamEvent) => void,
+): Promise<DispatchOutcome> {
+  // ---- BATCH tools ----
+  if (name === 'place_properties') {
+    return runBatch(
+      state.city, toolUseId,
+      (input as { properties?: PlacePropertyItem[] }).properties ?? [],
+      'place_property', formatProperty, 'placed', onEvent,
+    );
+  }
+  if (name === 'place_tile_rects') {
+    return runBatch(
+      state.city, toolUseId,
+      (input as { rects?: PlaceTileRectItem[] }).rects ?? [],
+      'place_tile_rect', formatTileRect, 'placed', onEvent,
+    );
+  }
+  if (name === 'place_natures') {
+    return runBatch(
+      state.city, toolUseId,
+      (input as { natures?: PlaceNatureItem[] }).natures ?? [],
+      'place_nature', formatNature, 'placed', onEvent,
+    );
+  }
+  if (name === 'delete_tile_rects') {
+    return runBatch(
+      state.city, toolUseId,
+      (input as { rects?: DeleteTileRectItem[] }).rects ?? [],
+      'delete_tile_rect', formatDeleteTileRect, 'cleared', onEvent,
+    );
+  }
+  if (name === 'delete_properties' || name === 'delete_natures') {
+    const singleton = name === 'delete_properties' ? 'delete_property' : 'delete_nature';
+    const kind = name === 'delete_properties' ? 'property' : 'nature';
+    return runBatch(
+      state.city, toolUseId,
+      (input as { positions?: DeletePositionItem[] }).positions ?? [],
+      singleton,
+      (item: DeletePositionItem) => formatDeletePos(kind, item),
+      'removed', onEvent,
+    );
+  }
+
+  // ---- DELEGATE_ZONES: fan out to parallel Zone agents ----
+  if (name === 'delegate_zones') {
+    const rawZones = (input as { zones?: DelegateZonesItem[] }).zones ?? [];
+    // Normalize every bbox upfront so downstream checks + Zone loops see
+    // consistent corners (tolerates the model swapping x1/x2 etc.).
+    const zones: DelegateZonesItem[] = rawZones.map(z => ({
+      bbox: normalizeBbox(z.bbox),
+      instructions: z.instructions,
+    }));
+
+    // Validate before spawning anything. All-or-nothing — partial spawning is
+    // more confusing than one clear error.
+    const validationErrors: string[] = [];
+    for (let i = 0; i < zones.length; i++) {
+      const b = zones[i].bbox;
+      if (!bboxInGrid(b)) {
+        validationErrors.push(`[${i}] bbox ${formatBbox(b)} is outside the 50x50 grid`);
+        continue;
+      }
+      for (let j = 0; j < i; j++) {
+        if (bboxesIntersect(b, zones[j].bbox)) {
+          validationErrors.push(
+            `[${i}] bbox ${formatBbox(b)} intersects [${j}] ${formatBbox(zones[j].bbox)}`,
+          );
+          break;
+        }
+      }
+      for (const prior of state.completedZoneBboxes) {
+        if (bboxesIntersect(b, prior)) {
+          validationErrors.push(
+            `[${i}] bbox ${formatBbox(b)} intersects previously-delegated zone ${formatBbox(prior)}`,
+          );
+          break;
+        }
+      }
+    }
+    if (validationErrors.length > 0) {
+      return {
+        text: `delegate_zones rejected — fix the bboxes and retry:\n${validationErrors.join('\n')}`,
+        isError: true,
+      };
+    }
+
+    // Auto-shrink each bbox so it excludes roads/sidewalks the Mayor laid.
+    const trimNotes: string[] = [];
+    const trimmed: Array<
+      { original: Bbox; bbox: Bbox; instructions: string } | { skip: true; reason: string; index: number }
+    > = [];
+    for (let i = 0; i < zones.length; i++) {
+      const z = zones[i];
+      const t = trimInfrastructureFromBbox(state.city, z.bbox);
+      if (!t) {
+        trimNotes.push(
+          `[${i}] ${formatBbox(z.bbox)} has no grass interior after stripping infrastructure — skipped`,
+        );
+        trimmed.push({ skip: true, reason: 'all infrastructure', index: i });
+        continue;
+      }
+      if (t.x1 !== z.bbox.x1 || t.y1 !== z.bbox.y1 || t.x2 !== z.bbox.x2 || t.y2 !== z.bbox.y2) {
+        trimNotes.push(`[${i}] ${formatBbox(z.bbox)} → ${formatBbox(t)} (trimmed roads/sidewalks)`);
+      }
+      trimmed.push({ original: z.bbox, bbox: t, instructions: z.instructions });
+    }
+
+    // Adapter: Zone emits ZoneEvent, Mayor forwards as MayorStreamEvent.
+    const zoneAdapter = (e: ZoneEvent) => {
+      if (e.kind === 'tool_applied') {
+        onEvent({
+          kind: 'tool_applied',
+          tool_use_id: e.tool_use_id,
+          name: e.name,
+          input: e.input,
+          result: e.result,
+          source: 'zone',
+        });
+      } else if (e.kind === 'zone_message') {
+        onEvent({ kind: 'zone_message', text: e.text });
+      }
+    };
+
+    const envId = await ensureEnvIdForZones();
+    const spawnIndices: number[] = [];
+    const spawnPromises: Promise<import('./zone').ZoneBuildResult>[] = [];
+    for (let i = 0; i < trimmed.length; i++) {
+      const t = trimmed[i];
+      if ('skip' in t) continue;
+      spawnIndices.push(i);
+      spawnPromises.push(
+        runZoneBuild(t.bbox, t.instructions, state.city, envId, i, zoneAdapter),
+      );
+    }
+    const zoneResults = await Promise.allSettled(spawnPromises);
+
+    const lines: string[] = [];
+    if (trimNotes.length > 0) lines.push(`bbox adjustments:\n${trimNotes.join('\n')}`);
+    let totalBuildings = 0;
+    for (let k = 0; k < zoneResults.length; k++) {
+      const res = zoneResults[k];
+      const i = spawnIndices[k];
+      if (res.status === 'fulfilled') {
+        lines.push(res.value.summary);
+        totalBuildings += Object.values(res.value.counts).reduce((a, b) => a + b, 0);
+        // Track the ORIGINAL (pre-trim) bbox so future delegations can't
+        // overlap territory already claimed, even if the interior was smaller.
+        state.completedZoneBboxes.push(zones[i].bbox);
+      } else {
+        const msg = res.reason instanceof Error ? res.reason.message : String(res.reason);
+        lines.push(`zone ${i} FAILED: ${msg}`);
+      }
+    }
+    for (let i = 0; i < trimmed.length; i++) {
+      if ('skip' in trimmed[i]) lines.push(`zone ${i} skipped — no buildable interior`);
+    }
+
+    return {
+      text:
+        `${spawnPromises.length}/${zones.length} zones spawned. Total placements: ${totalBuildings}.\n\n` +
+        lines.join('\n'),
+      isError: false,
+    };
+  }
+
+  // ---- SINGLETON path (place_property / place_tile_rect / finish / ...) ----
+  const call = parseToolCall(name, input);
+  const result: ToolResult = call
+    ? applyToolCall(state.city, call)
+    : {
+        ok: false,
+        error: `unknown tool '${name}'. Valid: place_property, place_properties, place_tile_rect, place_tile_rects, place_nature, place_natures, delete_property, delete_properties, delete_tile_rect, delete_tile_rects, delete_nature, delete_natures, delegate_zones, finish`,
+      };
+
+  onEvent({ kind: 'tool_applied', tool_use_id: toolUseId, name, input, result });
+
+  return {
+    text: result.ok ? 'ok' : result.error,
+    isError: !result.ok,
+    done: result.ok && 'done' in result && result.done === true,
+  };
+}
+
 export async function runMayorLoop(
   sessionId: string,
   onEvent: (e: MayorStreamEvent) => void,
@@ -523,11 +962,47 @@ export async function runMayorLoop(
   // in `requires_action` forever waiting on a reply that never comes.
   const pending = new Set<string>();
 
+  // ── Build telemetry ────────────────────────────────────────────────────
+  // Printed to the server console as [bench] lines so a normal UI run yields
+  // the same numbers as scripts/bench-mayor.mjs. Paste these when comparing
+  // MAYOR_EFFORT settings. NOTE: `agent.thinking` is a BUFFERED event — it
+  // fires when the thinking block ENDS, so its timestamp is the end of
+  // thinking, not the start (thinking begins at span.model_request_start).
+  const tStart = Date.now();
+  const secs = (ms: number) => (ms / 1000).toFixed(1);
+  const stamp = () => secs(Date.now() - tStart).padStart(6);
+  const turnOut: number[] = [];
+  let totalCacheRead = 0;
+  let firstThinkingEndMs: number | null = null;
+  let firstToolCallMs: number | null = null;
+  console.log(
+    `[bench] ═══ build start · model=${MAYOR_MODEL} effort=${MAYOR_EFFORT} ` +
+    `prompt=${MAYOR_PROMPT_VERSION} (${MAYOR_SYSTEM.length} chars) · ${sessionId}`
+  );
+
   try {
     for await (const event of stream) {
       onEvent({ kind: 'anthropic_event', event });
 
+      if (event.type === 'agent.thinking') {
+        if (firstThinkingEndMs === null) firstThinkingEndMs = Date.now() - tStart;
+        console.log(`[bench] ${stamp()}s  thinking block ended`);
+      } else if (event.type === 'span.model_request_end') {
+        const u = event.model_usage;
+        const out = u?.output_tokens ?? 0;
+        const cacheRead = u?.cache_read_input_tokens ?? 0;
+        turnOut.push(out);
+        totalCacheRead += cacheRead;
+        console.log(
+          `[bench] ${stamp()}s  turn ${turnOut.length}: ${out} out · ${cacheRead} cache read`
+        );
+      }
+
       if (event.type === 'agent.custom_tool_use') {
+        if (firstToolCallMs === null) {
+          firstToolCallMs = Date.now() - tStart;
+          console.log(`[bench] ${stamp()}s  FIRST TOOL CALL (${event.name})`);
+        }
         pending.add(event.id);
         customToolUseCount++;
 
@@ -568,344 +1043,19 @@ export async function runMayorLoop(
           });
         };
 
-        // ---- BATCH: place_properties ----
-        if (event.name === 'place_properties') {
-          const items =
-            (event.input as { properties?: PlacePropertyItem[] }).properties ?? [];
-          let okCount = 0;
-          const failures: string[] = [];
+        // All tool handling lives in dispatchMayorTool so the direct runtime
+        // shares exactly this logic. We just wrap the outcome in the
+        // Managed-Agents-shaped result event.
+        const out = await dispatchMayorTool(
+          state,
+          event.id,
+          event.name,
+          event.input as Record<string, unknown>,
+          onEvent,
+        );
+        await sendResult(out.text, out.isError);
 
-          for (let i = 0; i < items.length; i++) {
-            const item = items[i];
-            const result = applyToolCall(state.city, {
-              name: 'place_property',
-              input: item,
-            });
-            // Per-item synthetic event so the frontend renders progressively
-            // and uses the existing place_property handler, not a new batch shape.
-            onEvent({
-              kind: 'tool_applied',
-              tool_use_id: `${event.id}#${i}`,
-              name: 'place_property',
-              input: item as unknown as Record<string, unknown>,
-              result,
-            });
-            if (result.ok) okCount++;
-            else failures.push(`[${i}] ${formatProperty(item)}: ${result.error}`);
-          }
-
-          const text =
-            failures.length === 0
-              ? `ok: all ${items.length} placed`
-              : `partial: ${okCount}/${items.length} placed\nfailed:\n${failures.join('\n')}`;
-          await sendResult(text, failures.length > 0);
-          await sendCapNudgeIfHit();
-          continue;
-        }
-
-        // ---- BATCH: place_tile_rects ----
-        if (event.name === 'place_tile_rects') {
-          const items =
-            (event.input as { rects?: PlaceTileRectItem[] }).rects ?? [];
-          let okCount = 0;
-          const failures: string[] = [];
-
-          for (let i = 0; i < items.length; i++) {
-            const item = items[i];
-            const result = applyToolCall(state.city, {
-              name: 'place_tile_rect',
-              input: item,
-            });
-            onEvent({
-              kind: 'tool_applied',
-              tool_use_id: `${event.id}#${i}`,
-              name: 'place_tile_rect',
-              input: item as unknown as Record<string, unknown>,
-              result,
-            });
-            if (result.ok) okCount++;
-            else failures.push(`[${i}] ${formatTileRect(item)}: ${result.error}`);
-          }
-
-          const text =
-            failures.length === 0
-              ? `ok: all ${items.length} placed`
-              : `partial: ${okCount}/${items.length} placed\nfailed:\n${failures.join('\n')}`;
-          await sendResult(text, failures.length > 0);
-          await sendCapNudgeIfHit();
-          continue;
-        }
-
-        // ---- BATCH: place_natures ----
-        if (event.name === 'place_natures') {
-          const items =
-            (event.input as { natures?: PlaceNatureItem[] }).natures ?? [];
-          let okCount = 0;
-          const failures: string[] = [];
-
-          for (let i = 0; i < items.length; i++) {
-            const item = items[i];
-            const result = applyToolCall(state.city, {
-              name: 'place_nature',
-              input: item,
-            });
-            onEvent({
-              kind: 'tool_applied',
-              tool_use_id: `${event.id}#${i}`,
-              name: 'place_nature',
-              input: item as unknown as Record<string, unknown>,
-              result,
-            });
-            if (result.ok) okCount++;
-            else failures.push(`[${i}] ${formatNature(item)}: ${result.error}`);
-          }
-
-          const text =
-            failures.length === 0
-              ? `ok: all ${items.length} placed`
-              : `partial: ${okCount}/${items.length} placed\nfailed:\n${failures.join('\n')}`;
-          await sendResult(text, failures.length > 0);
-          await sendCapNudgeIfHit();
-          continue;
-        }
-
-        // ---- BATCH: delete_properties / delete_tile_rects / delete_natures ----
-        if (
-          event.name === 'delete_properties' ||
-          event.name === 'delete_natures'
-        ) {
-          const items =
-            (event.input as { positions?: DeletePositionItem[] }).positions ?? [];
-          const singletonName =
-            event.name === 'delete_properties' ? 'delete_property' : 'delete_nature';
-          const kind: 'property' | 'nature' =
-            event.name === 'delete_properties' ? 'property' : 'nature';
-          let okCount = 0;
-          const failures: string[] = [];
-
-          for (let i = 0; i < items.length; i++) {
-            const item = items[i];
-            const result = applyToolCall(state.city, {
-              name: singletonName,
-              input: item,
-            } as ToolCall);
-            onEvent({
-              kind: 'tool_applied',
-              tool_use_id: `${event.id}#${i}`,
-              name: singletonName,
-              input: item as unknown as Record<string, unknown>,
-              result,
-            });
-            if (result.ok) okCount++;
-            else failures.push(`[${i}] ${formatDeletePos(kind, item)}: ${result.error}`);
-          }
-
-          const text =
-            failures.length === 0
-              ? `ok: all ${items.length} removed`
-              : `partial: ${okCount}/${items.length} removed\nfailed:\n${failures.join('\n')}`;
-          await sendResult(text, failures.length > 0);
-          await sendCapNudgeIfHit();
-          continue;
-        }
-
-        if (event.name === 'delete_tile_rects') {
-          const items =
-            (event.input as { rects?: DeleteTileRectItem[] }).rects ?? [];
-          let okCount = 0;
-          const failures: string[] = [];
-
-          for (let i = 0; i < items.length; i++) {
-            const item = items[i];
-            const result = applyToolCall(state.city, {
-              name: 'delete_tile_rect',
-              input: item,
-            });
-            onEvent({
-              kind: 'tool_applied',
-              tool_use_id: `${event.id}#${i}`,
-              name: 'delete_tile_rect',
-              input: item as unknown as Record<string, unknown>,
-              result,
-            });
-            if (result.ok) okCount++;
-            else failures.push(`[${i}] ${formatDeleteTileRect(item)}: ${result.error}`);
-          }
-
-          const text =
-            failures.length === 0
-              ? `ok: all ${items.length} cleared to grass`
-              : `partial: ${okCount}/${items.length} cleared\nfailed:\n${failures.join('\n')}`;
-          await sendResult(text, failures.length > 0);
-          await sendCapNudgeIfHit();
-          continue;
-        }
-
-        // ---- DELEGATE_ZONES: fan out to parallel Zone agents ----
-        if (event.name === 'delegate_zones') {
-          const rawZones =
-            (event.input as { zones?: DelegateZonesItem[] }).zones ?? [];
-          // Normalize every bbox upfront so downstream checks + Zone loops see
-          // consistent corners (tolerates LLM swapping x1/x2 etc.).
-          const zones: DelegateZonesItem[] = rawZones.map(z => ({
-            bbox: normalizeBbox(z.bbox),
-            instructions: z.instructions,
-          }));
-
-          // Validate bboxes before spawning anything. All-or-nothing validation —
-          // partial spawning is more confusing than a single clear error.
-          const validationErrors: string[] = [];
-          for (let i = 0; i < zones.length; i++) {
-            const b = zones[i].bbox;
-            if (!bboxInGrid(b)) {
-              validationErrors.push(
-                `[${i}] bbox ${formatBbox(b)} is outside the 50x50 grid`,
-              );
-              continue;
-            }
-            // Intra-batch intersection
-            for (let j = 0; j < i; j++) {
-              if (bboxesIntersect(b, zones[j].bbox)) {
-                validationErrors.push(
-                  `[${i}] bbox ${formatBbox(b)} intersects [${j}] ${formatBbox(zones[j].bbox)}`,
-                );
-                break;
-              }
-            }
-            // Prior-delegation intersection
-            for (const prior of state.completedZoneBboxes) {
-              if (bboxesIntersect(b, prior)) {
-                validationErrors.push(
-                  `[${i}] bbox ${formatBbox(b)} intersects previously-delegated zone ${formatBbox(prior)}`,
-                );
-                break;
-              }
-            }
-          }
-
-          if (validationErrors.length > 0) {
-            const text =
-              `delegate_zones rejected — fix the bboxes and retry:\n${validationErrors.join('\n')}`;
-            await sendResult(text, true);
-            await sendCapNudgeIfHit();
-            continue;
-          }
-
-          // Auto-shrink each requested bbox so it excludes any roads/sidewalks
-          // the Mayor laid. Zones never see those tiles inside their bbox, so
-          // they can't overwrite them or try to build on top.
-          const trimNotes: string[] = [];
-          const trimmed: Array<{ original: Bbox; bbox: Bbox; instructions: string } | { skip: true; reason: string; index: number }> = [];
-          for (let i = 0; i < zones.length; i++) {
-            const z = zones[i];
-            const t = trimInfrastructureFromBbox(state.city, z.bbox);
-            if (!t) {
-              trimNotes.push(`[${i}] ${formatBbox(z.bbox)} has no grass interior after stripping infrastructure — skipped`);
-              trimmed.push({ skip: true, reason: 'all infrastructure', index: i });
-              continue;
-            }
-            if (t.x1 !== z.bbox.x1 || t.y1 !== z.bbox.y1 || t.x2 !== z.bbox.x2 || t.y2 !== z.bbox.y2) {
-              trimNotes.push(`[${i}] ${formatBbox(z.bbox)} → ${formatBbox(t)} (trimmed roads/sidewalks)`);
-            }
-            trimmed.push({ original: z.bbox, bbox: t, instructions: z.instructions });
-          }
-
-          // Adapter: Zone emits ZoneEvent, Mayor forwards as MayorStreamEvent.
-          const zoneAdapter = (e: ZoneEvent) => {
-            if (e.kind === 'tool_applied') {
-              onEvent({
-                kind: 'tool_applied',
-                tool_use_id: e.tool_use_id,
-                name: e.name,
-                input: e.input,
-                result: e.result,
-                source: 'zone',
-              });
-            } else if (e.kind === 'zone_message') {
-              onEvent({ kind: 'zone_message', text: e.text });
-            }
-          };
-
-          // Spawn only the zones that have a non-empty interior after trimming.
-          // Skipped zones report back to the Mayor in the summary so they can
-          // adjust the partition next turn.
-          const spawnIndices: number[] = [];
-          const spawnPromises: Promise<import('./zone').ZoneBuildResult>[] = [];
-          for (let i = 0; i < trimmed.length; i++) {
-            const t = trimmed[i];
-            if ('skip' in t) continue;
-            spawnIndices.push(i);
-            spawnPromises.push(
-              runZoneBuild(
-                t.bbox,
-                t.instructions,
-                state.city,
-                cachedEnvId as string,
-                i,
-                zoneAdapter,
-              ),
-            );
-          }
-          const zoneResults = await Promise.allSettled(spawnPromises);
-
-          // Aggregate summary for the Mayor.
-          const lines: string[] = [];
-          if (trimNotes.length > 0) {
-            lines.push(`bbox adjustments:\n${trimNotes.join('\n')}`);
-          }
-          let totalBuildings = 0;
-          for (let k = 0; k < zoneResults.length; k++) {
-            const res = zoneResults[k];
-            const i = spawnIndices[k];
-            if (res.status === 'fulfilled') {
-              lines.push(res.value.summary);
-              totalBuildings += Object.values(res.value.counts).reduce((a, b) => a + b, 0);
-              // Track the Mayor's ORIGINAL bbox (pre-trim) so future delegate_zones
-              // calls can't overlap territory the Mayor has already claimed,
-              // even if the actual Zone interior was smaller.
-              state.completedZoneBboxes.push(zones[i].bbox);
-            } else {
-              const msg = res.reason instanceof Error ? res.reason.message : String(res.reason);
-              lines.push(`zone ${i} FAILED: ${msg}`);
-            }
-          }
-          // Mention skipped zones in the summary too.
-          for (let i = 0; i < trimmed.length; i++) {
-            const t = trimmed[i];
-            if ('skip' in t) {
-              lines.push(`zone ${i} skipped — no buildable interior`);
-            }
-          }
-          const spawned = spawnPromises.length;
-          const text =
-            `${spawned}/${zones.length} zones spawned. Total placements: ${totalBuildings}.\n\n` +
-            lines.join('\n');
-          await sendResult(text, false);
-          await sendCapNudgeIfHit();
-          continue;
-        }
-
-        // ---- SINGLETON path (place_property / place_tile_rect / finish) ----
-        const call = parseToolCall(event.name, event.input);
-        const result: ToolResult = call
-          ? applyToolCall(state.city, call)
-          : {
-              ok: false,
-              error: `unknown tool '${event.name}'. Valid: place_property, place_properties, place_tile_rect, place_tile_rects, place_nature, place_natures, delete_property, delete_properties, delete_tile_rect, delete_tile_rects, delete_nature, delete_natures, delegate_zones, finish`,
-            };
-
-        onEvent({
-          kind: 'tool_applied',
-          tool_use_id: event.id,
-          name: event.name,
-          input: event.input,
-          result,
-        });
-
-        await sendResult(result.ok ? 'ok' : result.error, !result.ok);
-
-        // finish tool → exit the loop on our side too.
-        if (result.ok && 'done' in result && result.done === true) {
+        if (out.done) {
           onEvent({ kind: 'done', reason: 'finish tool called' });
           return;
         }
@@ -958,5 +1108,258 @@ export async function runMayorLoop(
     }
     pending.clear();
     state.running = false;
+
+    const totalOut = turnOut.reduce((s, n) => s + n, 0);
+    const na = (ms: number | null) => (ms === null ? 'n/a' : `${secs(ms)}s`);
+    console.log(
+      `[bench] ═══ SUMMARY model=${MAYOR_MODEL} effort=${MAYOR_EFFORT} prompt=${MAYOR_PROMPT_VERSION}\n` +
+      `[bench]     total wall time          ${secs(Date.now() - tStart)}s\n` +
+      `[bench]     first-turn thinking      ${na(firstThinkingEndMs)}\n` +
+      `[bench]     time to first tool call  ${na(firstToolCallMs)}\n` +
+      `[bench]     first-turn output        ${turnOut[0] ?? 0}\n` +
+      `[bench]     total output tokens      ${totalOut}\n` +
+      `[bench]     per-turn output          [${turnOut.join(', ')}]\n` +
+      `[bench]     model requests           ${turnOut.length}\n` +
+      `[bench]     tool calls (mayor)       ${customToolUseCount}\n` +
+      `[bench]     cache read (all turns)   ${totalCacheRead}`
+    );
   }
+}
+
+// ============================================================
+// DIRECT RUNTIME — we own the agent loop
+// ============================================================
+// Same contract as runMayorLoop: consume state.pendingGoal, emit
+// MayorStreamEvents, return when the build ends. Differences from Managed
+// Agents: no agent/environment/session provisioning, the transcript lives in
+// state.messages, and thinking + effort are per-request instead of baked into
+// an agent version.
+
+// Synthetic Managed-Agents-shaped events so the existing frontend switch
+// (session.status_running / _idle / _terminated / agent.message) works
+// unchanged across both runtimes.
+function asMaEvent(e: unknown): BetaManagedAgentsStreamSessionEvents {
+  return e as BetaManagedAgentsStreamSessionEvents;
+}
+
+export async function runMayorLoopDirect(
+  sessionId: string,
+  onEvent: (e: MayorStreamEvent) => void,
+): Promise<void> {
+  const state = sessions.get(sessionId);
+  if (!state) throw new Error(`[mayor] unknown sessionId: ${sessionId}`);
+  if (state.running) throw new Error(`[mayor] loop already running for ${sessionId}`);
+
+  // Same guard as the managed loop: a bare EventSource reconnect after finish
+  // has nothing queued and should exit rather than start a fresh turn.
+  if (!state.pendingGoal) {
+    onEvent({ kind: 'done', reason: 'no pending goal — nothing to do' });
+    return;
+  }
+
+  state.running = true;
+  const goal = state.pendingGoal;
+  state.pendingGoal = undefined;
+  state.messages.push({ role: 'user', content: goal });
+
+  // ── Build telemetry (mirrors the managed loop so numbers are comparable) ──
+  const tStart = Date.now();
+  const secs = (ms: number) => (ms / 1000).toFixed(1);
+  const stamp = () => secs(Date.now() - tStart).padStart(6);
+  const turnOut: number[] = [];
+  let totalCacheRead = 0;
+  let firstThinkingEndMs: number | null = null;
+  let firstToolCallMs: number | null = null;
+  let toolCallCount = 0;
+  console.log(
+    `[bench] ═══ build start · runtime=direct model=${MAYOR_MODEL} effort=${MAYOR_EFFORT} ` +
+    `thinking=${MAYOR_THINKING} prompt=${MAYOR_PROMPT_VERSION} (${MAYOR_SYSTEM.length} chars) · ${sessionId}`
+  );
+
+  // Messages API tool shape is exactly our stored schema shape.
+  const tools = TOOL_SCHEMAS.map(s => ({
+    name: s.name,
+    description: s.description,
+    input_schema: s.input_schema,
+  }));
+
+  onEvent({ kind: 'anthropic_event', event: asMaEvent({ type: 'session.status_running' }) });
+
+  try {
+    for (;;) {
+      // Interrupt is just a flag here — checked at the turn boundary, which is
+      // the only safe place to stop without orphaning a tool_use block.
+      if (state.interrupted) {
+        onEvent({ kind: 'done', reason: 'interrupted' });
+        return;
+      }
+
+      onEvent({
+        kind: 'anthropic_event',
+        event: asMaEvent({ type: 'span.model_request_start' }),
+      });
+
+      const stream = client().messages.stream({
+        model: MAYOR_MODEL,
+        max_tokens: MAYOR_MAX_TOKENS,
+        // Breakpoint on the system block covers tools + system (render order is
+        // tools → system → messages), so the static prefix is cached from turn two.
+        system: [
+          { type: 'text', text: MAYOR_SYSTEM, cache_control: { type: 'ephemeral' } },
+        ],
+        tools,
+        ...(MAYOR_THINKING === 'adaptive'
+          ? { thinking: { type: 'adaptive' as const } }
+          : { thinking: { type: 'disabled' as const } }),
+        output_config: { effort: MAYOR_EFFORT },
+        messages: state.messages,
+      });
+
+      const msg = await stream.finalMessage();
+
+      const u = msg.usage;
+      turnOut.push(u.output_tokens ?? 0);
+      totalCacheRead += u.cache_read_input_tokens ?? 0;
+
+      // Mirror the Managed Agents span/thinking events so the SSE consumers
+      // (scripts/bench-mayor.mjs, and anything the UI adds later) see the same
+      // stream shape under both runtimes.
+      const hasThinking = msg.content.some(b => b.type === 'thinking');
+      if (hasThinking) {
+        if (firstThinkingEndMs === null) firstThinkingEndMs = Date.now() - tStart;
+        onEvent({ kind: 'anthropic_event', event: asMaEvent({ type: 'agent.thinking' }) });
+      }
+      onEvent({
+        kind: 'anthropic_event',
+        event: asMaEvent({
+          type: 'span.model_request_end',
+          model_usage: {
+            input_tokens: u.input_tokens ?? 0,
+            output_tokens: u.output_tokens ?? 0,
+            cache_read_input_tokens: u.cache_read_input_tokens ?? 0,
+            cache_creation_input_tokens: u.cache_creation_input_tokens ?? 0,
+          },
+        }),
+      });
+      console.log(
+        `[bench] ${stamp()}s  turn ${turnOut.length}: ${u.output_tokens ?? 0} out · ` +
+        `${u.cache_read_input_tokens ?? 0} cache read · stop=${msg.stop_reason}`
+      );
+
+      // Forward assistant prose in the same shape Managed Agents emitted.
+      const text = msg.content
+        .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+        .map(b => b.text)
+        .join('');
+      if (text) {
+        onEvent({
+          kind: 'anthropic_event',
+          event: asMaEvent({ type: 'agent.message', content: [{ type: 'text', text }] }),
+        });
+      }
+
+      // Echo content back verbatim — thinking blocks must round-trip unmodified.
+      state.messages.push({ role: 'assistant', content: msg.content });
+
+      if (msg.stop_reason !== 'tool_use') {
+        onEvent({
+          kind: 'anthropic_event',
+          event: asMaEvent({ type: 'session.status_idle', stop_reason: { type: 'end_turn' } }),
+        });
+        onEvent({ kind: 'done', reason: `stop_reason: ${msg.stop_reason}` });
+        return;
+      }
+
+      const toolResults: Anthropic.ToolResultBlockParam[] = [];
+      let finished = false;
+
+      for (const block of msg.content) {
+        if (block.type !== 'tool_use') continue;
+        toolCallCount++;
+        if (firstToolCallMs === null) {
+          firstToolCallMs = Date.now() - tStart;
+          console.log(`[bench] ${stamp()}s  FIRST TOOL CALL (${block.name})`);
+        }
+
+        const out = await dispatchMayorTool(
+          state,
+          block.id,
+          block.name,
+          (block.input ?? {}) as Record<string, unknown>,
+          onEvent,
+        );
+
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: block.id,
+          content: out.text,
+          is_error: out.isError,
+        });
+        if (out.done) finished = true;
+      }
+
+      // Every tool_use needs a matching tool_result in ONE user message —
+      // splitting them across messages degrades parallel tool calling.
+      if (toolResults.length > 0) {
+        // Cache the growing prefix: breakpoint on the last result block so the
+        // next turn reads the whole conversation instead of reprocessing it.
+        // The API caps at 4 cache_control blocks per request and ours would
+        // otherwise accumulate one per turn, so retire the previous breakpoint
+        // first — only the newest one (plus the system block) should survive.
+        for (const m of state.messages) {
+          if (!Array.isArray(m.content)) continue;
+          for (const b of m.content) {
+            if (b && typeof b === 'object' && 'cache_control' in b) {
+              delete (b as { cache_control?: unknown }).cache_control;
+            }
+          }
+        }
+        toolResults[toolResults.length - 1].cache_control = { type: 'ephemeral' };
+        state.messages.push({ role: 'user', content: toolResults });
+      }
+
+      if (finished) {
+        onEvent({ kind: 'done', reason: 'finish tool called' });
+        return;
+      }
+
+      if (toolCallCount >= MAX_CUSTOM_TOOL_USES) {
+        state.messages.push({
+          role: 'user',
+          content:
+            `You've reached the turn cap (${MAX_CUSTOM_TOOL_USES} tool calls). ` +
+            `Call finish with a brief reason to conclude.`,
+        });
+      }
+    }
+  } finally {
+    state.running = false;
+    const totalOut = turnOut.reduce((s, n) => s + n, 0);
+    const na = (ms: number | null) => (ms === null ? 'n/a' : `${secs(ms)}s`);
+    console.log(
+      `[bench] ═══ SUMMARY runtime=direct model=${MAYOR_MODEL} effort=${MAYOR_EFFORT} ` +
+      `thinking=${MAYOR_THINKING} prompt=${MAYOR_PROMPT_VERSION}\n` +
+      `[bench]     total wall time          ${secs(Date.now() - tStart)}s\n` +
+      `[bench]     first-turn thinking      ${na(firstThinkingEndMs)}\n` +
+      `[bench]     time to first tool call  ${na(firstToolCallMs)}\n` +
+      `[bench]     first-turn output        ${turnOut[0] ?? 0}\n` +
+      `[bench]     total output tokens      ${totalOut}\n` +
+      `[bench]     per-turn output          [${turnOut.join(', ')}]\n` +
+      `[bench]     model requests           ${turnOut.length}\n` +
+      `[bench]     tool calls (mayor)       ${toolCallCount}\n` +
+      `[bench]     cache read (all turns)   ${totalCacheRead}`
+    );
+  }
+}
+
+// Entry point used by the SSE route — picks the runtime. Both implementations
+// have identical signatures and emit identical events, so flipping
+// MAYOR_RUNTIME is the only change needed to A/B them.
+export function runMayorBuild(
+  sessionId: string,
+  onEvent: (e: MayorStreamEvent) => void,
+): Promise<void> {
+  return MAYOR_RUNTIME === 'direct'
+    ? runMayorLoopDirect(sessionId, onEvent)
+    : runMayorLoop(sessionId, onEvent);
 }
