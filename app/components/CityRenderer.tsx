@@ -15,6 +15,7 @@ import { ChatPanel, type SaveState } from './city/ChatPanel';
 import { Palette } from './city/Palette';
 import { CitizenStatsPopup } from './city/CitizenStatsPopup';
 import { CitizenSpeechBubble } from './city/CitizenSpeechBubble';
+import { useCitizenVoice } from './city/useCitizenVoice';
 import { PropertyInfoPopup } from './city/PropertyInfoPopup';
 import { ResponseTimePopup } from './city/ResponseTimePopup';
 import { sendCitizenChat, initialChatState, type ChatState } from './city/citizenChat';
@@ -78,6 +79,11 @@ export default function CityRenderer({
   const chatStateRef = useRef<ChatState>(initialChatState);
   useEffect(() => { chatStateRef.current = chatState; }, [chatState]);
   const chatAbortRef = useRef<AbortController | null>(null);
+
+  // Live voice interview with the selected citizen. Owned here rather than in
+  // the stats popup because the speech bubble renders the same call — one hook
+  // instance, one socket. Hangs up on its own when the selection changes.
+  const voice = useCitizenVoice(selectedCitizen);
 
   useEffect(() => {
     setChatState(initialChatState);
@@ -410,11 +416,13 @@ export default function CityRenderer({
             onClose={() => setSelectedCitizen(null)}
             chatState={chatState}
             onSendChat={onSendChat}
+            voice={voice}
           />
           <CitizenSpeechBubble
             citizen={selectedCitizen}
             worldRef={worldRef}
             chatState={chatState}
+            voice={voice}
           />
         </>
       )}

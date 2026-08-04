@@ -1,4 +1,4 @@
-import type { Person } from '@/lib/all_types';
+import { citizenGender, type Person } from '@/lib/all_types';
 import { formatPropertyLabel, formatTripDestination, PROPERTY_LABELS } from './propertyLabels';
 
 // One completed exchange in the chat with a citizen.
@@ -22,6 +22,7 @@ export const initialChatState: ChatState = { history: [], pending: false, error:
 export type CitizenChatContext = {
   name: string;
   age_group: 'adult' | 'child';
+  gender: 'male' | 'female';
   job: string | null;
   home_type: string;
   needs: { hunger: number; boredom: number; tiredness: number };
@@ -56,6 +57,10 @@ export function buildCitizenContext(c: Person): CitizenChatContext {
   return {
     name: c.name,
     age_group: c.age_group,
+    // Resolved rather than read straight off the Person: citizens saved before
+    // `gender` existed don't carry one, and citizenGender() hashes the name so
+    // those keep the same voice across reloads instead of re-rolling.
+    gender: citizenGender(c),
     job: c.job,
     home_type: PROPERTY_LABELS[c.home.name] ?? c.home.name,
     needs: {

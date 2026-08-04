@@ -363,6 +363,11 @@ export const CODE_TO_PROPERTY: Record<string, PropertyName> = Object.fromEntries
 
 export type AgeGroup = "adult" | "child";
 
+// Drives the citizen's first name, TTS voice, and (later) sprite set, so all
+// three agree. Rolled once at spawn and stored rather than inferred from the
+// name, which lets the unisex names stay usable by either gender.
+export type Gender = "male" | "female";
+
 // Every adult is an engineer; the value of `Person.job` is the company name
 // (matching one of the offices' `company_name`). Children get `null`.
 // Display convention: "Engineer @ {job}".
@@ -389,6 +394,11 @@ export type Trip = {
 export type Person = {
   name: string;
   age_group: AgeGroup;
+  // Optional on purpose: cities saved to localStorage before this field
+  // existed have citizens without it. Read it through `citizenGender()`,
+  // which falls back to a name hash so old saves stay stable rather than
+  // flipping voice on every load.
+  gender?: Gender;
   job: Job;
   home: Property;
   current_location: Position;
@@ -429,12 +439,23 @@ export type Person = {
 export const randomBetween = (min: number, max: number): number =>
   Math.random() * (max - min) + min;
 
-const FIRST_NAMES = [
+// Names are drawn from the citizen's gender pool so that the name, the voice,
+// and (later) the sprite all agree. UNISEX sits in both pools rather than being
+// arbitrarily assigned to one — a "Taylor" can be either, and because gender is
+// stored on the Person the voice is still stable for that citizen.
+const UNISEX_FIRST_NAMES = [
   "Alex", "Sam", "Jordan", "Casey", "Riley", "Morgan", "Taylor", "Jamie",
-  "Dana", "Pat", "Robin", "Drew", "Quinn", "Avery", "Reese", "Sage",
-  "Maya", "Owen", "Iris", "Leo", "Nora", "Kai", "Ezra", "Luna",
-  "Hugo", "Vera", "Theo", "Elena", "Felix", "Naomi", "Kira", "Otto",
+  "Dana", "Pat", "Robin", "Drew", "Quinn", "Avery", "Reese", "Sage", "Kai",
 ];
+
+const MALE_FIRST_NAMES = ["Owen", "Leo", "Ezra", "Hugo", "Theo", "Felix", "Otto"];
+
+const FEMALE_FIRST_NAMES = ["Maya", "Iris", "Nora", "Luna", "Vera", "Elena", "Naomi", "Kira"];
+
+const firstNamePool = (gender: Gender): string[] =>
+  gender === "male"
+    ? [...UNISEX_FIRST_NAMES, ...MALE_FIRST_NAMES]
+    : [...UNISEX_FIRST_NAMES, ...FEMALE_FIRST_NAMES];
 
 const LAST_NAMES = [
   "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis",
@@ -442,31 +463,51 @@ const LAST_NAMES = [
   "Patel", "Nguyen", "Kim", "Chen", "Singh", "Khan", "Cohen", "Reyes",
 ];
 
-const generateRandomName = (): string =>
-  `${FIRST_NAMES[Math.floor(Math.random() * FIRST_NAMES.length)]} ${LAST_NAMES[Math.floor(Math.random() * LAST_NAMES.length)]}`;
+const generateRandomName = (gender: Gender): string => {
+  const first = firstNamePool(gender);
+  return `${first[Math.floor(Math.random() * first.length)]} ${LAST_NAMES[Math.floor(Math.random() * LAST_NAMES.length)]}`;
+};
+
+// FNV-1a over the name — same hash the voice picker uses. Only for citizens
+// persisted before `gender` existed: it keeps them consistent across reloads
+// instead of re-rolling, which would change their voice every session.
+export const citizenGender = (p: Pick<Person, "name" | "gender">): Gender => {
+  if (p.gender) return p.gender;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < p.name.length; i++) {
+    h ^= p.name.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h % 2 === 0 ? "male" : "female";
+};
 
 export const spawnPerson = (
   age_group: AgeGroup,
   home: Property,
   availableImages: string[],
   job: Job = null,
-): Person => ({
-  name: generateRandomName(),
-  age_group,
-  job,
-  home,
-  current_location: home.position,
-  current_path: [],
-  inside_property: home,
-  hunger: randomBetween(1.0, 4.0),
-  boredom: randomBetween(1.0, 4.0),
-  tiredness: randomBetween(1.0, 4.0),
-  hunger_rate: weightedNormal(HUNGER_RATE_DISTRIBUTION),
-  boredom_rate: weightedNormal(BOREDOM_RATE_DISTRIBUTION),
-  tiredness_rate: weightedNormal(TIREDNESS_RATE_DISTRIBUTION),
-  image: availableImages[Math.floor(Math.random() * availableImages.length)],
-  trips: [],
-});
+): Person => {
+  // Rolled first: the name pool depends on it, and later the sprite will too.
+  const gender: Gender = Math.random() < 0.5 ? "male" : "female";
+  return {
+    name: generateRandomName(gender),
+    age_group,
+    gender,
+    job,
+    home,
+    current_location: home.position,
+    current_path: [],
+    inside_property: home,
+    hunger: randomBetween(1.0, 4.0),
+    boredom: randomBetween(1.0, 4.0),
+    tiredness: randomBetween(1.0, 4.0),
+    hunger_rate: weightedNormal(HUNGER_RATE_DISTRIBUTION),
+    boredom_rate: weightedNormal(BOREDOM_RATE_DISTRIBUTION),
+    tiredness_rate: weightedNormal(TIREDNESS_RATE_DISTRIBUTION),
+    image: availableImages[Math.floor(Math.random() * availableImages.length)],
+    trips: [],
+  };
+};
 
 // ============================================================
 // CITY TYPE

@@ -6,6 +6,8 @@ import type { Person } from '@/lib/all_types';
 import { gridToScreen } from './constants';
 import { PROPERTY_LABELS, formatPropertyLabel } from './propertyLabels';
 import type { ChatState } from './citizenChat';
+import type { CitizenVoice } from './useCitizenVoice';
+import { VoiceChatBar } from './VoiceChatBar';
 
 type Props = {
   citizen: Person;
@@ -14,6 +16,8 @@ type Props = {
   onClose: () => void;
   chatState: ChatState;
   onSendChat: (question: string) => void;
+  // Owned by CityRenderer so the speech bubble can render the same live call.
+  voice: CitizenVoice;
 };
 
 const NeedRow = ({ label, value, rate, color }: { label: string; value: number; rate: number; color: string }) => (
@@ -30,7 +34,7 @@ const NeedRow = ({ label, value, rate, color }: { label: string; value: number; 
   </div>
 );
 
-export function CitizenStatsPopup({ citizen, worldRef, onClose, chatState, onSendChat }: Props) {
+export function CitizenStatsPopup({ citizen, worldRef, onClose, chatState, onSendChat, voice }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const [chatInput, setChatInput] = useState('');
@@ -131,7 +135,7 @@ export function CitizenStatsPopup({ citizen, worldRef, onClose, chatState, onSen
           placeholder="Ask me anything…"
           disabled={chatState.pending}
           maxLength={500}
-          className="flex-1 bg-[#1a2540] border border-white/30 px-2 py-1 text-[11px] focus:outline-none focus:border-fuchsia-400 disabled:opacity-50 placeholder:text-white/30"
+          className="flex-1 min-w-0 bg-[#1a2540] border border-white/30 px-3 py-1.5 text-[11px] focus:outline-none focus:border-fuchsia-400 disabled:opacity-50 placeholder:text-white/30"
         />
         <button
           type="button"
@@ -142,6 +146,9 @@ export function CitizenStatsPopup({ citizen, worldRef, onClose, chatState, onSen
           Send
         </button>
       </div>
+
+      {/* Voice chat + agent audio visualizer */}
+      <VoiceChatBar voice={voice} />
     </div>
   );
 }

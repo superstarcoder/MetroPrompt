@@ -5,27 +5,43 @@ import type { RefObject } from 'react';
 import type { Person } from '@/lib/all_types';
 import { gridToScreen } from './constants';
 import type { ChatState } from './citizenChat';
+import type { CitizenVoice } from './useCitizenVoice';
 
 type Props = {
   citizen: Person;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   worldRef: RefObject<any>;
   chatState: ChatState;
+  voice: CitizenVoice;
 };
 
 // Pixel-themed speech bubble that floats to the RIGHT of the citizen sprite
 // (independent of the stats popup, which is anchored above the head). The
 // bubble's left-pointing tail visually attaches it to the citizen.
-export function CitizenSpeechBubble({ citizen, worldRef, chatState }: Props) {
+export function CitizenSpeechBubble({ citizen, worldRef, chatState, voice }: Props) {
   const ref = useRef<HTMLDivElement>(null);
+
+  // A live call takes over the bubble. Both channels speak as the same citizen,
+  // so showing a stale typed reply next to a voice answer would read as two
+  // people talking at once.
+  const onCall = voice.status !== 'idle' && voice.status !== 'error';
 
   const lastReply = chatState.history.length > 0
     ? chatState.history[chatState.history.length - 1].reply
     : null;
-  const showThinking = chatState.pending;
-  const showError = !chatState.pending && chatState.error !== null;
-  const showReply = !chatState.pending && !chatState.error && lastReply !== null;
-  const visible = showThinking || showError || showReply;
+
+  const showThinking = onCall ? voice.status === 'thinking' : chatState.pending;
+  const showError = onCall
+    ? false
+    : (!chatState.pending && chatState.error !== null);
+  const showVoiceError = !onCall && voice.status === 'error' && voice.error !== null;
+  // Mid-call and nothing said yet — the bubble stays up as a "line is open" cue
+  // rather than blinking out between turns.
+  const showWaiting = onCall && !showThinking && voice.spokenText === '';
+  const showSpoken = onCall && !showThinking && voice.spokenText !== '';
+  const showReply = !onCall && !chatState.pending && !chatState.error && lastReply !== null;
+
+  const visible = showThinking || showError || showVoiceError || showWaiting || showSpoken || showReply;
 
   useEffect(() => {
     if (!visible) return;
@@ -64,7 +80,9 @@ export function CitizenSpeechBubble({ citizen, worldRef, chatState }: Props) {
       ref={ref}
       onPointerDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
-      className="absolute z-20 px-3 py-2 bg-white text-black border-2 border-black font-mono text-[11px] leading-snug"
+      // Slightly more padding on the left than the right: the tail overlaps the
+      // border on that side, so text set flush against it reads as clipped.
+      className="absolute z-20 pl-4 pr-3 py-2 bg-white text-black border-2 border-black font-mono text-[11px] leading-snug"
       style={{
         left: 0,
         top: 0,
@@ -114,6 +132,25 @@ export function CitizenSpeechBubble({ citizen, worldRef, chatState }: Props) {
       )}
       {showError && chatState.error && (
         <span className="text-red-700">⚠ {chatState.error}</span>
+      )}
+      {showVoiceError && voice.error && (
+        <span className="text-red-700">⚠ {voice.error}</span>
+      )}
+      {showWaiting && (
+        <span className="flex items-center gap-1 text-black/50 italic">
+          <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+          {voice.muted ? 'muted' : 'listening…'}
+        </span>
+      )}
+      {showSpoken && (
+        <span>
+          {voice.spokenText}
+          {/* Caret only while words are still arriving, so a finished line
+              doesn't look like it stopped mid-sentence. */}
+          {voice.status === 'speaking' && (
+            <span className="inline-block w-[2px] h-[11px] ml-[2px] align-[-1px] bg-black animate-pulse" />
+          )}
+        </span>
       )}
       {showReply && lastReply && (
         <span>{lastReply}</span>

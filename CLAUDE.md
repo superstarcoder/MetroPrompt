@@ -13,6 +13,7 @@ Pixel-art city builder, originally for a hackathon ("Build For What's Next"). Us
 | Agents | **Mayor: direct Messages API loop** (own the loop; see Agent Runtimes). Zones: Claude Managed Agents with custom tools |
 | Streaming | SSE: Next.js route handler -> browser EventSource (managed runtime adds an upstream Anthropic session stream) |
 | Chat rendering | `react-markdown` + `remark-gfm`, styles in `globals.css` under `.chat-md` |
+| Voice | Deepgram **Voice Agent API** (Flux STT + Claude Haiku 4.5 + Aura-2 TTS over one WebSocket) |
 | Pixel art | PixelLab (AI-assisted isometric sprites) |
 
 ## Project Structure
@@ -21,7 +22,7 @@ Pixel-art city builder, originally for a hackathon ("Build For What's Next"). Us
 MetroPrompt/
   assets/               -- pixel art sprites
   app/                  -- Next.js application
-    .env.local          -- ANTHROPIC_API_KEY (+ MAYOR_AGENT_ID / MAYOR_ENV_ID / ZONE_AGENT_ID,
+    .env.local          -- ANTHROPIC_API_KEY, DEEPGRAM_API_KEY (+ MAYOR_AGENT_ID / MAYOR_ENV_ID / ZONE_AGENT_ID,
                         --  only used by the managed runtime; direct needs just the key)
     app/
       page.tsx          -- server component entry
@@ -34,6 +35,7 @@ MetroPrompt/
           message/route.ts              -- POST: redirect (user.message)
           followup/route.ts             -- POST: queue follow-up goal
       api/citizen-chat/route.ts         -- POST: interview a citizen (grounded in their trip log)
+      api/voice-agent/token/route.ts    -- POST: mint Deepgram JWT + persona/voice/keyterms
     components/
       CityRendererWrapper.tsx           -- 'use client', dynamic import w/ ssr:false
       CityRenderer.tsx                  -- 'use client', composes hooks + UI
@@ -49,6 +51,8 @@ MetroPrompt/
         useMayorSession.ts             -- SSE stream, tool_applied -> city mutations, build/followup/pause/redirect
         useSimulation.ts                -- sim tick driver: needs decay, movement, firetruck response
         citizenChat.ts                  -- builds CitizenChatContext from a Person, calls /api/citizen-chat
+        useCitizenVoice.ts              -- Deepgram Voice Agent socket, mic capture, playback, visualizer
+        VoiceChatBar.tsx                -- voice chat button + status + output visualizer row
         propertyLabels.ts               -- display names for properties / trip destinations
         ChatPanel.tsx                   -- draggable/minimizable chat panel w/ feed + composer
         Palette.tsx                     -- building/nature thumbnail sidebar
@@ -61,6 +65,7 @@ MetroPrompt/
       cityStore.ts                      -- localStorage persistence
       renderConfig.ts                   -- per-sprite render offsets/scale
       agent/
+        citizenPrompt.ts                -- shared citizen persona (text + voice), voice picker, keyterms
         tools.ts                        -- tool schemas, handlers, applyToolCall, grass-only validation
         mayor.ts                        -- Mayor: prompts (v1/v2), config toggles, dispatchMayorTool,
                                         --  runMayorLoop (managed) + runMayorLoopDirect, runMayorBuild
@@ -180,6 +185,8 @@ Direct runtime: conversation history lives in `state.messages` and follow-ups ap
 
 `ANTHROPIC_API_KEY` is the only one the direct runtime needs. `MAYOR_AGENT_ID` / `MAYOR_ENV_ID` / `ZONE_AGENT_ID` apply to Managed Agents; missing IDs trigger fresh `agents.create()` / `environments.create()` calls.
 
+`DEEPGRAM_API_KEY` is needed for voice. It must hold the **Member or Owner** role -- a restricted key passes inference calls (so it looks fine everywhere else) but gets 403 on `/v1/auth/grant`, which is the only endpoint the token route uses.
+
 **You no longer drop the agent ID when the prompt or tools change.** `ensureMayor()` reconciles a pinned agent once per boot: it retrieves the current version and pushes the config from code as a new version. Updates are versioned and no-op when nothing changed, so this neither spams versions nor requires a restart. Pin `MAYOR_AGENT_ID` -- an unpinned ID means a brand-new agent object on every boot.
 
 ## Data Schema (`app/lib/all_types.tsx`)
@@ -232,7 +239,9 @@ City = {
 
 ### People (`Person`)
 
-`name`, `age_group` (adult/child), `job`, `home`, `current_location`, `current_path`, `inside_property`, needs (`hunger`/`boredom`/`tiredness` 1-10) with per-person decay rates.
+`name`, `age_group` (adult/child), `gender?` (male/female), `job`, `home`, `current_location`, `current_path`, `inside_property`, needs (`hunger`/`boredom`/`tiredness` 1-10) with per-person decay rates.
+
+**Gender** is rolled 50/50 at spawn and drives the first-name pool, the TTS voice pool, and (planned) the sprite set, so all three agree. It is *stored*, not inferred from the name -- which is what lets the unisex first names (Alex, Sam, Taylor, ...) stay usable by either gender while the voice stays stable per citizen. The field is optional because cities saved before it existed have citizens without it; **always read it through `citizenGender(person)`**, which falls back to a name hash so old saves don't re-roll their voice on every load.
 
 ### Key Helpers
 
@@ -286,11 +295,44 @@ When `editable={true}` (used by `/cities/[id]`):
 ### Deepgram voice branch (in progress)
 
 15. **Stage 1 -- Complete:** make the agent loop fast enough for real-time voice (above).
-16. **Stage 2 -- Next:** Deepgram **Voice Agent API** integration. Prove the mic -> STT -> LLM -> TTS -> speaker path with barge-in on the simplest surface first (citizen interviews already work end-to-end in text, have no tools in the loop, and return fast).
+16. **Stage 2 -- Complete:** Deepgram **Voice Agent API** integration on citizen interviews. Full mic -> Flux STT -> Claude Haiku -> Aura-2 TTS -> speaker path with barge-in, plus a live output visualizer. See Voice Architecture below.
 17. **Stage 3:** live formal interview with the Mayor about citizen feedback and future plans. **Prerequisite (not voice work):** log *failed* wants -- `pickDestination` returns null when nothing is reachable and nothing is recorded, so "I got hungry and there was nowhere to go" is currently invisible. Then aggregate citizen feedback for the Mayor.
 18. **Stage 4:** talk to the Mayor live while it builds -- narration of tool calls, mute/unmute, barge-in wired to the interrupt path.
 
 **Deferred:** report generation, stream reconnect, per-zone interrupt, cross-playthrough memory, moving Zones onto the direct runtime (~47% of remaining build wall time).
+
+## Voice Architecture (Deepgram Voice Agent)
+
+Deepgram owns the entire speech loop -- STT, LLM, TTS, turn detection, and barge-in
+-- over one WebSocket. We only move audio in and out and mirror the state it reports.
+
+```
+app/api/voice-agent/token/route.ts  -- mints a ~60s JWT + builds the persona payload
+lib/agent/citizenPrompt.ts          -- ONE persona source shared by voice + text chat
+components/city/useCitizenVoice.ts  -- browser socket, mic capture, playback, visualizer
+components/city/VoiceChatBar.tsx    -- button + status + 24-bar output visualizer
+```
+
+**The browser connects to Deepgram directly**, not through us: proxying a bidirectional
+audio stream through a route handler would add a hop to every 20ms frame in both
+directions. The `DEEPGRAM_API_KEY` still never leaves the server -- what ships to the
+client is a short-TTL JWT, useless once it expires.
+
+### Hard-won details (changing any of these silently breaks the session)
+
+| Detail | Why |
+|---|---|
+| **Native `WebSocket`, not the SDK's socket** | Its `ReconnectingWebSocket` passes auth via `options.headers` on `new WebSocket(url, protocols, options)`. Node's `ws` honours that 3rd argument; **browsers silently discard it**, so auth never leaves the page and the promise never settles -- the UI just hangs on "Connecting...". The SDK is fine server-side for minting tokens. |
+| Auth rides the **subprotocol**: `['bearer', <jwt>]` | Verified against the live endpoint. `?access_token=` returns 401. API keys use `['token', <key>]`. |
+| Settings keys are **snake_case** (`sample_rate`) | camelCase is ignored and silently falls back to defaults. No `any` cast on the payload, on purpose, so the compiler keeps them honest. |
+| Flux STT needs `version: 'v2'` on the listen provider | Omitting it fails the model lookup. |
+| Handlers wired **before** the socket opens | Greeting audio can arrive within ms of `SettingsApplied`; a late listener misses the citizen's first words. |
+| Unexpected close -> error, never silent | Close code is the only useful diagnostic the browser gives (1006 pre-open = auth; close right after Settings = payload). |
+| `AnalyserNode` sits **on** the playback path | Visualizer reads from it, so bars move only when the citizen actually speaks. |
+| Voice = FNV-1a hash of the name, **within the citizen's gender pool** | A citizen must sound the same every time or they stop reading as a character. A hash gives that with no per-citizen voice field to persist. Pools live in `citizenPrompt.ts`; all IDs verified against the voice list in `@deepgram/sdk`. |
+| Barge-in flushes scheduled `AudioBufferSourceNode`s | Deepgram detects the interruption server-side, but already-buffered audio keeps playing over the user unless we stop it. |
+| Muting gates the mic **send**, not the track | No frames reach Deepgram, so it never detects a user turn -- mute disables barge-in by construction rather than by a second rule that could drift. Toggling needs no re-permission, and `KeepAlive` holds the socket through the silence. |
+| Transcript reveal is paced to the **audio clock** | `ConversationText` is one complete statement -- there are no token deltas to stream. `useCitizenVoice` instead meters characters out against `outCtx.currentTime`, bounded by `MAX_REVEAL_CHARS_PER_SEC`, so words surface as they're spoken. Snaps to full on `AgentAudioDone`; freezes mid-sentence on barge-in, because that's what the citizen actually got to say. |
 
 ## Known Limitations
 
@@ -303,3 +345,4 @@ When `editable={true}` (used by `/cities/[id]`):
 **Resolved** (don't reintroduce these workarounds):
 - ~~No SDK knob to disable extended thinking~~ -- the direct runtime sets `thinking` per request. This was the single largest source of build latency.
 - ~~Agent config changes require deleting `*_AGENT_ID` and restarting~~ -- `ensureMayor()` reconciles via `agents.update()`.
+- ~~Tailwind padding/margin utilities silently do nothing~~ -- `globals.css` had a hand-written `* { margin: 0; padding: 0 }` reset. Tailwind v4 puts utilities in `@layer utilities`, and **unlayered CSS outranks any layered rule regardless of specificity**, so that one line zeroed out every `p-*` and `m-*` class app-wide. Preflight already applies the same reset inside `@layer base`. Don't add a bare `*` reset after `@import "tailwindcss"`.
