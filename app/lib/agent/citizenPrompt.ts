@@ -7,7 +7,15 @@ export type CitizenContext = {
   age_group: 'adult' | 'child';
   gender: 'male' | 'female';  // selects the TTS voice pool
   job: string | null;          // company name (offices) or null
+  job_blurb: string | null;    // what that company actually does
   home_type: string;           // "house" | "apartment"
+  // What exists in THIS city. Scoped to properties actually built, so a
+  // citizen can't recommend a restaurant that was never placed — and so the
+  // gaps (no hospital, no park) are visible to them as gaps.
+  directory: {
+    businesses: Array<{ name: string; kind: string; blurb: string }>;
+    amenities: Array<{ label: string; count: number }>;
+  };
   needs: { hunger: number; boredom: number; tiredness: number };
   // Status snapshot at chat time.
   status: 'walking' | 'inside' | 'idle';
@@ -20,8 +28,34 @@ export type CitizenContext = {
 const LONG_WALK_THRESHOLD = 50; // tiles — anything beyond this "feels long"
 const MAX_RECENT_TRIPS = 6;     // how many recent trips to surface in the prompt
 
-function jobDescription(job: string | null): string {
-  return job ? `Engineer at ${job}` : 'currently unemployed';
+function jobDescription(job: string | null, blurb: string | null): string {
+  if (!job) return 'currently unemployed';
+  return blurb ? `Engineer at ${job} — ${blurb}` : `Engineer at ${job}`;
+}
+
+// The city as the citizen knows it. Listing what exists also communicates what
+// DOESN'T: a citizen who sees no hospital in their own directory will say so
+// when asked, instead of inventing one.
+function describeCity(d: CitizenContext['directory']): string {
+  const lines: string[] = ['The city you live in:'];
+
+  if (d.businesses.length > 0) {
+    for (const b of d.businesses) {
+      // Colon, not a dash: several blurbs contain their own em-dash and the
+      // line turned into "Sakura Ramen (Restaurant) — Japanese — ramen".
+      lines.push(`- ${b.name} (${b.kind}): ${b.blurb}`);
+    }
+  }
+  if (d.amenities.length > 0) {
+    const summary = d.amenities
+      .map(a => (a.count > 1 ? `${a.count} ${a.label}s` : `1 ${a.label}`))
+      .join(', ');
+    lines.push(`- Also here: ${summary}.`);
+  }
+  if (d.businesses.length === 0 && d.amenities.length === 0) {
+    lines.push('- Almost nothing has been built yet.');
+  }
+  return lines.join('\n');
 }
 
 function summarizeTrips(trips: CitizenContext['trips']): string {
@@ -35,12 +69,9 @@ function summarizeTrips(trips: CitizenContext['trips']): string {
     const tag = t.distance > LONG_WALK_THRESHOLD ? ' (long walk!)' : '';
     return `- ${t.destination} — ${t.distance} tiles${tag}`;
   }).join('\n');
-  const pct = Math.round((longWalks / total) * 100);
   return [
-    `Recent trips (last ${recent.length} of ${total}):`,
+    `Recent trips (${recent.length} of ${total}; ${longWalks} were long walks over ${LONG_WALK_THRESHOLD} tiles):`,
     recentLines,
-    '',
-    `Stats: ${total} trips total, ${longWalks} over ${LONG_WALK_THRESHOLD} tiles (${pct}% long walks).`,
   ].join('\n');
 }
 
@@ -56,11 +87,13 @@ function statusLine(c: CitizenContext): string {
 
 export function buildCitizenSystemPrompt(c: CitizenContext): string {
   return [
-    `You are ${c.name}, a resident of a small city. You're roleplaying — respond AS them, in first person, casually. You're a regular person, not an AI assistant.`,
+    `You are ${c.name}, a resident of a small city. Answer as them — first person, casual, human. You are not an assistant.`,
     '',
     'Profile:',
-    `- Job: ${jobDescription(c.job)}`,
+    `- Job: ${jobDescription(c.job, c.job_blurb)}`,
     `- Home: ${c.home_type}`,
+    '',
+    describeCity(c.directory),
     '',
     `Current needs (1 = fine, 10 = urgent):`,
     `- Hunger: ${c.needs.hunger.toFixed(1)}/10`,
@@ -71,12 +104,21 @@ export function buildCitizenSystemPrompt(c: CitizenContext): string {
     '',
     summarizeTrips(c.trips),
     '',
-    'Rules for your reply:',
-    '- VERY SHORT: 1-2 sentences max. Be terse.',
-    '- Stay in character. Talk naturally, like a person texting a friend.',
-    '- If a need is high (>7) or many of your trips have been long walks, let that color your tone naturally — don\'t force it.',
-    "- Don't list stats at the user. Just answer.",
-    '- If asked broadly how you like the city (or anything similar — "how\'s life", "your thoughts on the place", etc.), name at least ONE thing you like. Feel free to also include any improvements (eg: more bike lanes, more walkable distances, more restaurants/cafes, etc.) Fit both into your 1-2 sentences.',
+    'HOW TO TALK:',
+    '- Short. 25 words max, usually less. Fragments are fine.',
+    '- Like chatting with a friend. Be casual and friendly. Most importantly, be human! You are a human.',
+    // Only the BAD example is quoted. A quoted GOOD one gets copied verbatim —
+    // "same bug for three days" showed up in nearly every reply when it was
+    // here as the model answer.
+    '- Specific, not generic. Name the actual thing that happened. Never "nothing crazy, just working".',
+    '- Have opinions. Like some things, be annoyed by others.',
+    '- Never recite your stats. Just answer.',
+    '',
+    'You can invent small personal details — what you\'re working on, who you live with, last weekend — if they fit the facts and stay consistent. Never invent a place that isn\'t listed above.',
+    '',
+    // This one asks for two things, so it's the reply most likely to run long.
+    // Restate the limit or it drifts to 35+ words.
+    'Asked how you like the city? One thing you like, one you\'d change, both from what you\'ve actually experienced. Still under 25 words.',
   ].join('\n');
 }
 
@@ -87,13 +129,19 @@ export function buildCitizenVoicePrompt(c: CitizenContext): string {
   return [
     buildCitizenSystemPrompt(c),
     '',
-    'You are being interviewed OUT LOUD — your reply is read by a speech synthesizer:',
-    '- Never use markdown, bullet points, numbers, or emoji. Plain spoken sentences only.',
-    '- Use contractions and natural filler the way people actually talk.',
-    '- Say numbers as words ("about forty tiles", not "40").',
-    '- Keep it to one or two sentences. Long answers are painful to listen to.',
-    '- If interrupted, stop and answer the new question. Do not restart the old answer.',
+    'This is spoken out loud by a speech synthesizer:',
+    '- No markdown, lists, or emoji. Plain sentences.',
+    '- Numbers as words ("about forty tiles", not "40").',
+    '- Keep it short. Long answers are painful to listen to.',
+    '- Provide both positive and negative feedback when asked.',
+    '- If interrupted, answer the new question. Don\'t restart the old one.',
   ].join('\n');
+}
+
+function isDirectory(v: unknown): v is CitizenContext['directory'] {
+  if (!v || typeof v !== 'object') return false;
+  const o = v as Record<string, unknown>;
+  return Array.isArray(o.businesses) && Array.isArray(o.amenities);
 }
 
 export function isCitizenContext(v: unknown): v is CitizenContext {
@@ -106,7 +154,8 @@ export function isCitizenContext(v: unknown): v is CitizenContext {
     (o.job === null || typeof o.job === 'string') &&
     typeof o.home_type === 'string' &&
     typeof o.needs === 'object' && o.needs !== null &&
-    Array.isArray(o.trips)
+    Array.isArray(o.trips) &&
+    isDirectory(o.directory)
   );
 }
 

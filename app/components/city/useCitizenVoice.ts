@@ -1,7 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Person } from '@/lib/all_types';
+import type { RefObject } from 'react';
+import type { City, Person } from '@/lib/all_types';
 import { buildCitizenContext } from './citizenChat';
 
 // Live voice interview with a citizen over Deepgram's Voice Agent API.
@@ -61,7 +62,7 @@ export type CitizenVoice = {
 // Deepgram sends JSON control frames and binary audio frames over one socket.
 type AgentMessage = { type?: string; role?: string; content?: string; description?: string };
 
-export function useCitizenVoice(citizen: Person | null): CitizenVoice {
+export function useCitizenVoice(citizen: Person | null, cityRef: RefObject<City>): CitizenVoice {
   const [status, setStatus] = useState<VoiceStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const [transcript, setTranscript] = useState<VoiceTurn[]>([]);
@@ -193,7 +194,7 @@ export function useCitizenVoice(citizen: Person | null): CitizenVoice {
       const res = await fetch('/api/voice-agent/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ citizen: buildCitizenContext(citizen) }),
+        body: JSON.stringify({ citizen: buildCitizenContext(citizen, cityRef.current) }),
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
@@ -459,7 +460,7 @@ export function useCitizenVoice(citizen: Person | null): CitizenVoice {
       );
       setStatus('error');
     }
-  }, [citizen, flushPlayback, playChunk, teardown]);
+  }, [citizen, cityRef, flushPlayback, playChunk, teardown]);
 
   // Hang up when the selected citizen changes or the component unmounts —
   // otherwise a live session keeps talking as a citizen you're no longer on.

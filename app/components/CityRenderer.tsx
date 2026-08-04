@@ -83,7 +83,7 @@ export default function CityRenderer({
   // Live voice interview with the selected citizen. Owned here rather than in
   // the stats popup because the speech bubble renders the same call — one hook
   // instance, one socket. Hangs up on its own when the selection changes.
-  const voice = useCitizenVoice(selectedCitizen);
+  const voice = useCitizenVoice(selectedCitizen, cityRef);
 
   useEffect(() => {
     setChatState(initialChatState);
@@ -106,7 +106,7 @@ export default function CityRenderer({
     setChatState(s => ({ ...s, pending: true, error: null }));
 
     try {
-      const reply = await sendCitizenChat(selectedCitizen, priorHistory, trimmed, ctrl.signal);
+      const reply = await sendCitizenChat(selectedCitizen, cityRef.current, priorHistory, trimmed, ctrl.signal);
       if (ctrl.signal.aborted) return;
       setChatState(s => ({
         history: [...s.history, { question: trimmed, reply }],

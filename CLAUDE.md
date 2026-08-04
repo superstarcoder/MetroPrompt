@@ -76,7 +76,7 @@ MetroPrompt/
         spawning.ts                     -- populate a finished city with citizens
         decisions.ts                    -- need-driven destination choice (pickDestination/assignDestination)
         pathfinding.ts                  -- road/sidewalk-aware routing
-        companies.ts                    -- office employers
+        companies.ts                    -- names + one-line profiles for offices AND restaurants
         firetruck.ts                    -- emergency dispatch + response-time tracking
     scripts/
       bench-mayor.mjs                   -- headless build benchmark (POST /api/mayor + SSE, prints timings)
@@ -296,10 +296,39 @@ When `editable={true}` (used by `/cities/[id]`):
 
 15. **Stage 1 -- Complete:** make the agent loop fast enough for real-time voice (above).
 16. **Stage 2 -- Complete:** Deepgram **Voice Agent API** integration on citizen interviews. Full mic -> Flux STT -> Claude Haiku -> Aura-2 TTS -> speaker path with barge-in, plus a live output visualizer. See Voice Architecture below.
-17. **Stage 3:** live formal interview with the Mayor about citizen feedback and future plans. **Prerequisite (not voice work):** log *failed* wants -- `pickDestination` returns null when nothing is reachable and nothing is recorded, so "I got hungry and there was nowhere to go" is currently invisible. Then aggregate citizen feedback for the Mayor.
+17. **Stage 3:** live formal interview with the Mayor about citizen feedback and future plans.
+    - **Prereq A -- Complete:** ground citizens in a concrete world (see Citizen Grounding below).
+    - **Prereq B -- Next:** log *failed* wants. `pickDestination` returns null when nothing is reachable and records nothing, so "I got hungry and there was nowhere to go" is still invisible. Then aggregate citizen feedback for the Mayor.
 18. **Stage 4:** talk to the Mayor live while it builds -- narration of tool calls, mute/unmute, barge-in wired to the interrupt path.
 
 **Deferred:** report generation, stream reconnect, per-zone interrupt, cross-playthrough memory, moving Zones onto the direct runtime (~47% of remaining build wall time).
+
+## Citizen Grounding
+
+Citizens answer better when they have concrete facts to draw on, so the prompt
+(`lib/agent/citizenPrompt.ts`, shared by text + voice) carries three things
+beyond their needs and trips:
+
+| | |
+|---|---|
+| **Employer profile** | Offices are named from `COMPANY_NAMES` and each has a hand-written one-liner in `COMPANY_PROFILES`. "How's work?" resolves against what the company actually does. |
+| **Named restaurants** | `RESTAURANTS` pairs a name with a cuisine and a dish blurb. Restaurants reuse `Property.company_name`, which already threaded through trip records and labels -- **no schema change was needed**. |
+| **City directory** | Every named business plus counts of the unnamed amenity types, scoped to **what was actually built**. Listing what exists also communicates what doesn't, so a citizen with no hospital in their directory says so instead of inventing one. |
+
+**These tables are hand-written, not model-generated, on purpose.** The set is
+small and fixed, and most companies are recognizable enough (Hooli, Aperture,
+Vault-Tec) that invented descriptions would be worse than the real joke. What
+*is* left to the model is the citizen's personal detail -- role, tenure, what
+they shipped last week -- improvised per reply under two hard constraints in
+the prompt: never invent a PLACE not in the directory, and never contradict
+the trips or needs. That keeps variety high without a persona-generation step,
+an extra route, or per-citizen state to persist.
+
+Consequence worth knowing: personal details are **not** stable across
+conversations. Within one chat the message history keeps the citizen
+consistent; start a new one and they may have a different job title. Fix if it
+ever matters: derive stable anchors from the name hash, the same trick
+`pickCitizenVoice` uses.
 
 ## Voice Architecture (Deepgram Voice Agent)
 
