@@ -1,8 +1,8 @@
 # MetroPrompt -- Agentic City Builder
 
-Pixel-art city builder for a hackathon ("Build For What's Next"). User prompts a **Mayor agent** (Claude Managed Agents) which lays roads and partitions the grid, then delegates regions in parallel to **Zone sub-agents**. Build streams live via SSE. Future: 7-day citizen simulation + Mayor report.
+Pixel-art city builder, originally for a hackathon ("Build For What's Next"). User prompts a **Mayor agent** which lays roads and partitions the grid, then delegates regions in parallel to **Zone sub-agents**. Build streams live via SSE. A citizen simulation then runs on the finished city -- citizens have needs, pathfind to properties, and can be interviewed about their experience.
 
-**Timeline:** 4-day hackathon (started ~2026-04-22)
+**Timeline:** 4-day hackathon (started ~2026-04-22); ongoing development since. Current work: Deepgram voice integration (see Build Stages).
 
 ## Tech Stack
 
@@ -10,9 +10,10 @@ Pixel-art city builder for a hackathon ("Build For What's Next"). User prompts a
 |---|---|
 | Framework | Next.js 16 (App Router) -- see `app/AGENTS.md` for breaking changes |
 | Rendering | Pixi.js v8 (vanilla, dynamic import, nearest-neighbor scaling) |
-| Agents | Claude Managed Agents with custom tools (`agent.custom_tool_use` / `user.custom_tool_result`) |
-| Streaming | Two-layer SSE: Anthropic session stream -> Next.js route handler -> browser EventSource |
+| Agents | **Mayor: direct Messages API loop** (own the loop; see Agent Runtimes). Zones: Claude Managed Agents with custom tools |
+| Streaming | SSE: Next.js route handler -> browser EventSource (managed runtime adds an upstream Anthropic session stream) |
 | Chat rendering | `react-markdown` + `remark-gfm`, styles in `globals.css` under `.chat-md` |
+| Voice | Deepgram **Voice Agent API** (Flux STT + Claude Haiku 4.5 + Aura-2 TTS over one WebSocket) |
 | Pixel art | PixelLab (AI-assisted isometric sprites) |
 
 ## Project Structure
@@ -21,7 +22,8 @@ Pixel-art city builder for a hackathon ("Build For What's Next"). User prompts a
 MetroPrompt/
   assets/               -- pixel art sprites
   app/                  -- Next.js application
-    .env.local          -- ANTHROPIC_API_KEY, MAYOR_AGENT_ID, MAYOR_ENV_ID, ZONE_AGENT_ID
+    .env.local          -- ANTHROPIC_API_KEY, DEEPGRAM_API_KEY (+ MAYOR_AGENT_ID / MAYOR_ENV_ID / ZONE_AGENT_ID,
+                        --  only used by the managed runtime; direct needs just the key)
     app/
       page.tsx          -- server component entry
       layout.tsx / globals.css
@@ -32,6 +34,8 @@ MetroPrompt/
           interrupt/route.ts            -- POST: halt session
           message/route.ts              -- POST: redirect (user.message)
           followup/route.ts             -- POST: queue follow-up goal
+      api/citizen-chat/route.ts         -- POST: interview a citizen (grounded in their trip log)
+      api/voice-agent/token/route.ts    -- POST: mint Deepgram JWT + persona/voice/keyterms
     components/
       CityRendererWrapper.tsx           -- 'use client', dynamic import w/ ssr:false
       CityRenderer.tsx                  -- 'use client', composes hooks + UI
@@ -45,16 +49,38 @@ MetroPrompt/
         useCityScene.ts                 -- Pixi app/world/layers, painter loop, pan/zoom, pointer events
         useCityEditor.ts               -- edit-mode: select/drag/delete entities, palette drag-to-place
         useMayorSession.ts             -- SSE stream, tool_applied -> city mutations, build/followup/pause/redirect
+        useSimulation.ts                -- sim tick driver: needs decay, movement, firetruck response
+        citizenChat.ts                  -- builds CitizenChatContext from a Person, calls /api/citizen-chat
+        useCitizenVoice.ts              -- Deepgram Voice Agent socket, mic capture, playback, visualizer
+        VoiceChatBar.tsx                -- voice chat button + status + output visualizer row
+        propertyLabels.ts               -- display names for properties / trip destinations
         ChatPanel.tsx                   -- draggable/minimizable chat panel w/ feed + composer
         Palette.tsx                     -- building/nature thumbnail sidebar
+        CitizenSpeechBubble.tsx         -- citizen chat bubble (pending / reply / error)
+        CitizenStatsPopup.tsx           -- selected-citizen needs + status panel
+        PropertyInfoPopup.tsx           -- property details on click
+        ResponseTimePopup.tsx           -- firetruck response-time readout
+        SimulationReport.tsx            -- end-of-run screen: fire log + per-citizen roster
     lib/
       all_types.tsx                     -- data schema (source of truth)
       cityStore.ts                      -- localStorage persistence
       renderConfig.ts                   -- per-sprite render offsets/scale
       agent/
+        citizenPrompt.ts                -- shared citizen persona (text + voice), voice picker, keyterms
         tools.ts                        -- tool schemas, handlers, applyToolCall, grass-only validation
-        mayor.ts                        -- Mayor agent: system prompt, session mgmt, runMayorLoop, delegate_zones
+        mayor.ts                        -- Mayor: prompts (v1/v2), config toggles, dispatchMayorTool,
+                                        --  runMayorLoop (managed) + runMayorLoopDirect, runMayorBuild
         zone.ts                         -- Zone agent: system prompt, runZoneBuild (bbox-enforced)
+        observation.ts                  -- city -> text observation for agents
+      sim/
+        constants.ts                    -- tick rates, need decay distributions, thresholds
+        spawning.ts                     -- populate a finished city with citizens
+        decisions.ts                    -- need-driven destination choice (pickDestination/assignDestination)
+        pathfinding.ts                  -- road/sidewalk-aware routing
+        companies.ts                    -- names + one-line profiles for offices AND restaurants
+        firetruck.ts                    -- emergency dispatch + response-time tracking
+    scripts/
+      bench-mayor.mjs                   -- headless build benchmark (POST /api/mayor + SSE, prints timings)
 ```
 
 ## SSR Pattern
@@ -81,7 +107,64 @@ MetroPrompt/
 
 ## Agent Architecture
 
-Two-tier: **Mayor** (coordinator, `claude-sonnet-4-6`) + **Zone** sub-agents (specialists, `claude-haiku-4-5`). Zone uses Haiku because its task is constrained -- Sonnet burned 20k+ tokens deliberating on simple zone fills.
+Two-tier: **Mayor** (coordinator, `claude-opus-5`) + **Zone** sub-agents (specialists, `claude-haiku-4-5`). Zone uses Haiku because its task is constrained -- Sonnet burned 20k+ tokens deliberating on simple zone fills.
+
+### Agent Runtimes (`MAYOR_RUNTIME` in `mayor.ts`)
+
+The Mayor can run on either of two interchangeable runtimes. Both emit identical `MayorStreamEvent`s, so **the frontend is unaffected by the choice**. `runMayorBuild()` dispatches; flipping the constant is the only change needed.
+
+| | `'managed'` | `'direct'` (current) |
+|---|---|---|
+| Loop | Anthropic runs it; we answer `agent.custom_tool_use` | We own it over `messages.stream()` |
+| Setup per build | `agents.create` / `environments.create` / `sessions.create` | none -- local UUID; config rides on each request |
+| Transcript | server-side session | `state.messages` in our own Map |
+| Thinking | **forced on, no knob** | per-request (`MAYOR_THINKING`) |
+| Effort | on the agent config | per-request `output_config.effort` |
+| Prompt caching | automatic | explicit `cache_control` (system + rolling history breakpoint) |
+
+**Zones always run on Managed Agents**, regardless of `MAYOR_RUNTIME`. In direct mode an environment is created lazily on first `delegate_zones`.
+
+`dispatchMayorTool()` holds *all* tool handling (batches, `delegate_zones`, singletons) and both runtimes call it, so the two paths provably execute the same logic.
+
+### Tuning knobs (all in `mayor.ts`, all logged in the `[bench]` header)
+
+| Constant | Current | Notes |
+|---|---|---|
+| `MAYOR_MODEL` | `claude-opus-5` | Read the warning at the constant before changing it or `MAYOR_THINKING`. |
+| `MAYOR_RUNTIME` | `'direct'` | `'managed'` is a one-line revert. |
+| `MAYOR_THINKING` | `'adaptive'` | Direct runtime only. **Must stay on under Opus 5** -- see below. |
+| `MAYOR_EFFORT` | `'low'` | Now the primary cost/latency lever, since thinking can't be switched off. `low`/`medium`/`high`/`xhigh`/`max` on Opus 5. Haiku 4.5 rejects `effort` -- don't set it on Zones. |
+
+**Why thinking can't be turned off any more.** Opus-5-generation models have a
+documented failure mode with `thinking: disabled`: a tool call gets written into
+the **visible text** instead of emitted as a `tool_use` block. The turn succeeds,
+the call silently never runs, no error is raised, and the stray text poisons
+later turns. A build loop that is nothing but tool calls (up to 70 per build) is
+the worst place for it -- the Mayor would appear to work and build nothing. Cost
+and latency are controlled with `MAYOR_EFFORT` instead; `low` is documented as
+unusually strong on Opus 5.
+
+Also fixed on this generation: `temperature` / `top_p` / `top_k` are rejected
+outright (400). The direct loop has never sent them -- keep it that way.
+
+**The `'off'` performance numbers below predate the model swap and no longer
+describe the shipped config** -- rerun `scripts/bench-mayor.mjs` before quoting
+them. Kept because the *attribution* they establish (thinking, not runtime, was
+the latency driver on Sonnet 4.6) is still the reason the direct runtime exists.
+| `MAYOR_PROMPT_VERSION` | `'v1'` | v1 long-form (~2,860 tok) / v2 condensed (~1,180 tok). Both live; flip to A/B. |
+
+### Performance (50x50 build, fixed benchmark prompt)
+
+| runtime | thinking | first tool call | total output | total wall |
+|---|---|---|---|---|
+| managed | forced on, effort `high` | 105s | ~13.7k | 248s |
+| managed | forced on, effort `medium` | 49.9s | 13.2k | 222.8s |
+| direct | `adaptive` | 134s | 14.3k | 227.7s |
+| **direct** | **`off`** | **7.3s** | **3.0k** | **82.9s** |
+
+Owning the loop bought nothing by itself -- platform overhead measured at ~5% of wall time, and `direct + adaptive` matched managed. **The entire win came from disabling thinking**, which Managed Agents cannot express. Thinking was ~86% of output tokens on the old config. Quality (zone tiling, walkability, coverage) held at `thinking: off`.
+
+Measure with `node scripts/bench-mayor.mjs` (needs `npm run dev` running), or read the `[bench]` lines the server prints on any UI build. Keep the goal string identical across runs or the numbers stop comparing.
 
 ### Core Design Principles
 
@@ -112,11 +195,17 @@ Mayor has 14 tools; Zones have 7 (no `delegate_zones`, no `delete_*`).
 
 ### Re-entrant Sessions
 
-Sessions persist in a module-level Map after `finish`. Follow-up flow: `POST /followup` -> queues goal -> browser opens fresh EventSource on `/stream` -> `runMayorLoop` consumes queued goal. `completedZoneBboxes` preserved across follow-ups to prevent re-delegation.
+Sessions persist in a module-level Map after `finish`. Follow-up flow: `POST /followup` -> queues goal -> browser opens fresh EventSource on `/stream` -> the loop consumes the queued goal. `completedZoneBboxes` preserved across follow-ups to prevent re-delegation.
+
+Direct runtime: conversation history lives in `state.messages` and follow-ups append to it. `sendInterrupt` sets a flag checked at each turn boundary (the only safe stop point -- interrupting mid-turn would orphan a `tool_use` block); `sendRedirect` appends to the transcript if the loop is live, otherwise queues as `pendingGoal`.
 
 ### Environment Variables
 
-`ANTHROPIC_API_KEY`, `MAYOR_AGENT_ID`, `MAYOR_ENV_ID`, `ZONE_AGENT_ID`. Missing IDs trigger fresh `agents.create()` calls. **Drop ID(s) and restart when agent tools/system prompt/model changes** (agent config is immutable per version).
+`ANTHROPIC_API_KEY` is the only one the direct runtime needs. `MAYOR_AGENT_ID` / `MAYOR_ENV_ID` / `ZONE_AGENT_ID` apply to Managed Agents; missing IDs trigger fresh `agents.create()` / `environments.create()` calls.
+
+`DEEPGRAM_API_KEY` is needed for voice. It must hold the **Member or Owner** role -- a restricted key passes inference calls (so it looks fine everywhere else) but gets 403 on `/v1/auth/grant`, which is the only endpoint the token route uses.
+
+**You no longer drop the agent ID when the prompt or tools change.** `ensureMayor()` reconciles a pinned agent once per boot: it retrieves the current version and pushes the config from code as a new version. Updates are versioned and no-op when nothing changed, so this neither spams versions nor requires a restart. Pin `MAYOR_AGENT_ID` -- an unpinned ID means a brand-new agent object on every boot.
 
 ## Data Schema (`app/lib/all_types.tsx`)
 
@@ -168,7 +257,9 @@ City = {
 
 ### People (`Person`)
 
-`name`, `age_group` (adult/child), `job`, `home`, `current_location`, `current_path`, `inside_property`, needs (`hunger`/`boredom`/`tiredness` 1-10) with per-person decay rates.
+`name`, `age_group` (adult/child), `gender?` (male/female), `job`, `home`, `current_location`, `current_path`, `inside_property`, needs (`hunger`/`boredom`/`tiredness` 1-10) with per-person decay rates.
+
+**Gender** is rolled 50/50 at spawn and drives the first-name pool, the TTS voice pool, and (planned) the sprite set, so all three agree. It is *stored*, not inferred from the name -- which is what lets the unisex first names (Alex, Sam, Taylor, ...) stay usable by either gender while the voice stays stable per citizen. The field is optional because cities saved before it existed have citizens without it; **always read it through `citizenGender(person)`**, which falls back to a name hash so old saves don't re-roll their voice on every load.
 
 ### Key Helpers
 
@@ -216,14 +307,182 @@ When `editable={true}` (used by `/cities/[id]`):
 
 1-12: **Complete** -- schema, rendering, Mayor agent, SSE streaming, batch tools, multi-agent (Mayor+Zones), nature placement, chat UI, edit tools + follow-ups, robustness (tool ledger, Haiku swap), saved cities + edit mode, frontend refactor (god-component -> hooks)
 
-13. **Next:** 7-day citizen simulation (decay, pathfinding, feedback -> Mayor report)
-14. **Deferred:** report generation, stream reconnect, per-zone interrupt, cross-playthrough memory
+13. **Complete** -- citizen simulation: needs decay, road-aware pathfinding, companies/jobs, firetruck emergency response, per-citizen trip log, click-to-interview citizens (`/api/citizen-chat`)
+14. **Complete** -- agent loop performance: direct Messages API runtime, thinking/effort/prompt toggles, shared tool dispatch, benchmark harness (3x faster builds, 78% fewer tokens)
+
+### Deepgram voice branch (in progress)
+
+15. **Stage 1 -- Complete:** make the agent loop fast enough for real-time voice (above).
+16. **Stage 2 -- Complete:** Deepgram **Voice Agent API** integration on citizen interviews. Full mic -> Flux STT -> Claude Haiku -> Aura-2 TTS -> speaker path with barge-in, plus a live output visualizer. See Voice Architecture below.
+17. **Stage 3:** live formal interview with the Mayor about citizen feedback and future plans.
+    - **Prereq A -- Complete:** ground citizens in a concrete world (see Citizen Grounding below).
+    - **Prereq B -- Complete:** log *failed* wants (`Person.unmet_wants`, see Unmet Wants below).
+    - **Next:** aggregate citizen feedback for the Mayor, then the interview itself.
+18. **Stage 4:** talk to the Mayor live while it builds -- narration of tool calls, mute/unmute, barge-in wired to the interrupt path.
+
+**Deferred:** report generation, stream reconnect, per-zone interrupt, cross-playthrough memory, moving Zones onto the direct runtime (~47% of remaining build wall time).
+
+## Citizen Grounding
+
+Citizens answer better when they have concrete facts to draw on, so the prompt
+(`lib/agent/citizenPrompt.ts`, shared by text + voice) carries three things
+beyond their needs and trips:
+
+| | |
+|---|---|
+| **Employer profile** | Offices are named from `COMPANY_NAMES` and each has a hand-written one-liner in `COMPANY_PROFILES`. "How's work?" resolves against what the company actually does. |
+| **Named restaurants** | `RESTAURANTS` pairs a name with a cuisine and a dish blurb. Restaurants reuse `Property.company_name`, which already threaded through trip records and labels -- **no schema change was needed**. |
+| **City directory** | Every named business plus counts of the unnamed amenity types, scoped to **what was actually built**. Listing what exists also communicates what doesn't, so a citizen with no hospital in their directory says so instead of inventing one. |
+
+**These tables are hand-written, not model-generated, on purpose.** The set is
+small and fixed, and most companies are recognizable enough (Hooli, Aperture,
+Vault-Tec) that invented descriptions would be worse than the real joke. What
+*is* left to the model is the citizen's personal detail -- role, tenure, what
+they shipped last week -- improvised per reply under two hard constraints in
+the prompt: never invent a PLACE not in the directory, and never contradict
+the trips or needs. That keeps variety high without a persona-generation step,
+an extra route, or per-citizen state to persist.
+
+Consequence worth knowing: personal details are **not** stable across
+conversations. Within one chat the message history keeps the citizen
+consistent; start a new one and they may have a different job title. Fix if it
+ever matters: derive stable anchors from the name hash, the same trick
+`pickCitizenVoice` uses.
+
+## Unmet Wants (`Person.unmet_wants`)
+
+A trip that never happened leaves no trace in `trips`, so the sim used to
+discard its most planner-relevant signal. `assignDestination` now records two
+distinct failures, each **deduped by (need, reason) with a counter** -- idle
+citizens re-decide every tick, so appending per failure would bury the signal
+under hundreds of identical rows.
+
+| reason | meaning | what it tells the Mayor |
+|---|---|---|
+| `no_option` | need >= 7 and **nothing but their own home** serves it | build the missing amenity |
+| `unreachable` | destinations exist but every path attempt failed | fix the road/sidewalk network |
+
+Three calibration decisions, each of which was **dead code without it**:
+
+- **Home is excluded from `no_option`.** A house serves hunger 5 / boredom 2 /
+  tiredness 10, so counting it made the check always false. The planner
+  question isn't "can this person eat" but "does the city offer anywhere to eat".
+- **Tiredness is excluded entirely** (`PUBLIC_NEEDS`). Home gives
+  tiredness 10, more than a hospital's 5, so sleeping at home is correct rather
+  than a gap. Left in, it fired in every city without a hospital.
+- **Threshold of 7** (`UNMET_NEED_THRESHOLD`) -- below that it's a mild
+  preference, not a complaint.
+
+`unreachable` is rare **by design**: grass is walkable, so a citizen is only
+stuck if genuinely boxed in (e.g. ringed by road tiles, which are not
+walkable). That is exactly the "can't go anywhere" case, and it is verified to
+fire once with `trips: 0`.
+
+## End-of-Run Report (`SimulationReport.tsx`)
+
+Opened by **end simulation**, which calls `endSim()` -- distinct from `stopSim()`
+because **`stopSim` clears `all_citizens`**, destroying the trip log and unmet
+wants the report is built from. `endSim` moves to `'done'` (stopping the tick
+interval) and leaves the world frozen in place. A **⊞ report** button reopens it
+while the run is `done`.
+
+Split vertically: roster on the **left**, Mayor debrief reserved on the right.
+Left column, in one scroll view:
+
+1. **Fire log** -- every call with its property and response time, plus
+   average / fastest / slowest. `fireLog` lives in `useSimulation` (run-scoped,
+   *not* on `City` -- saving a city shouldn't carry a fire history), is appended
+   on arrival at the scene, and resets on `startSim`/`stopSim` but **not** on
+   `endSim`. Average shows `—` rather than `0.0s` when there were no fires.
+2. **Citizen cards**, two per row: identity, employer + what it does, needs
+   (amber at >=7, the unmet-want threshold), trip totals, most-visited places,
+   recent trips, and unmet wants.
+
+## The MAYOR_DEBRIEF Agent
+
+**A different agent from the build-phase Mayor** (`mayor.ts`). It has **no
+tools**, never touches the city, and its entire context is the finished
+simulation. Lives in `lib/agent/mayorDebriefPrompt.ts`; served by
+`/api/voice-agent/mayor-debrief-token`; driven by `useMayorDebriefVoice`.
+
+Role in the prompt: the Mayor talking to the **city planner** who built the
+place. Opens by thanking them, leads with a pattern then the evidence, always
+pairs a problem with a buildable fix, and is barred from inventing a resident,
+business, or statistic.
+
+| knob | value | why |
+|---|---|---|
+| model | `claude-sonnet-5` | see MODEL NOTE below |
+| thinking | off | opt-in on the Messages API; Deepgram never requests it, so its absence *is* the setting |
+| tools | none | no `functions` key is ever sent |
+| voice | `aura-2-apollo-en` | fixed, unlike citizens' name-hash pick |
+| turn length | **hard 60-word cap** | without it, replies ran 100+ words / ~40s of audio |
+
+**MODEL NOTE — Opus is not available.** `GET
+https://agent.deepgram.com/v1/agent/settings/think/models` returns exactly four
+Anthropic options: `claude-haiku-4-5`, `claude-sonnet-4-5`, `claude-sonnet-4-6`,
+`claude-sonnet-5`. **No Opus at any tier.** Reaching Opus would mean bypassing
+Deepgram's think provider -- either `think.endpoint` (a custom LLM URL
+Deepgram's servers must reach, so not localhost, and the key would ride in the
+browser's Settings message) or dropping to raw Listen + Speak sockets and owning
+the loop, forfeiting Deepgram's turn detection and barge-in. `claude-sonnet-5`
+is the most capable model actually reachable through the Voice Agent socket.
+
+The city name comes from the `cityName` prop (saved cities) or the save-box
+text; when genuinely unnamed the prompt tells the Mayor to say "the city"
+rather than invent one.
+
+## Voice Architecture (Deepgram Voice Agent)
+
+Deepgram owns the entire speech loop -- STT, LLM, TTS, turn detection, and barge-in
+-- over one WebSocket. We only move audio in and out and mirror the state it reports.
+
+```
+components/city/useVoiceAgent.ts     -- THE transport: socket, mic, playback, reveal.
+                                    --  Shared by both agents; all protocol detail lives here.
+components/city/useCitizenVoice.ts   -- thin wrapper: citizen persona config
+components/city/useMayorDebriefVoice.ts -- thin wrapper: debrief report config
+app/api/voice-agent/token/route.ts   -- citizen: ~60s JWT + persona payload
+app/api/voice-agent/mayor-debrief-token/route.ts -- mayor: ~60s JWT + report payload
+lib/agent/citizenPrompt.ts           -- ONE persona source shared by voice + text chat
+lib/agent/mayorDebriefPrompt.ts      -- MAYOR_DEBRIEF prompt, model, voice
+components/city/VoiceChatBar.tsx     -- button + status + 24-bar output visualizer
+```
+
+The two agents differ **only** in the config the server returns (`prompt`,
+`voice`, `keyterms`, `greeting`, `model`). Anything protocol-level belongs in
+`useVoiceAgent` so it can't drift between them.
+
+**The browser connects to Deepgram directly**, not through us: proxying a bidirectional
+audio stream through a route handler would add a hop to every 20ms frame in both
+directions. The `DEEPGRAM_API_KEY` still never leaves the server -- what ships to the
+client is a short-TTL JWT, useless once it expires.
+
+### Hard-won details (changing any of these silently breaks the session)
+
+| Detail | Why |
+|---|---|
+| **Native `WebSocket`, not the SDK's socket** | Its `ReconnectingWebSocket` passes auth via `options.headers` on `new WebSocket(url, protocols, options)`. Node's `ws` honours that 3rd argument; **browsers silently discard it**, so auth never leaves the page and the promise never settles -- the UI just hangs on "Connecting...". The SDK is fine server-side for minting tokens. |
+| Auth rides the **subprotocol**: `['bearer', <jwt>]` | Verified against the live endpoint. `?access_token=` returns 401. API keys use `['token', <key>]`. |
+| Settings keys are **snake_case** (`sample_rate`) | camelCase is ignored and silently falls back to defaults. No `any` cast on the payload, on purpose, so the compiler keeps them honest. |
+| Flux STT needs `version: 'v2'` on the listen provider | Omitting it fails the model lookup. |
+| Handlers wired **before** the socket opens | Greeting audio can arrive within ms of `SettingsApplied`; a late listener misses the citizen's first words. |
+| Unexpected close -> error, never silent | Close code is the only useful diagnostic the browser gives (1006 pre-open = auth; close right after Settings = payload). |
+| `AnalyserNode` sits **on** the playback path | Visualizer reads from it, so bars move only when the citizen actually speaks. |
+| Voice = FNV-1a hash of the name, **within the citizen's gender pool** | A citizen must sound the same every time or they stop reading as a character. A hash gives that with no per-citizen voice field to persist. Pools live in `citizenPrompt.ts`; all IDs verified against the voice list in `@deepgram/sdk`. |
+| Barge-in flushes scheduled `AudioBufferSourceNode`s | Deepgram detects the interruption server-side, but already-buffered audio keeps playing over the user unless we stop it. |
+| Muting gates the mic **send**, not the track | No frames reach Deepgram, so it never detects a user turn -- mute disables barge-in by construction rather than by a second rule that could drift. Toggling needs no re-permission, and `KeepAlive` holds the socket through the silence. |
+| Transcript reveal is paced to the **audio clock** | `ConversationText` is one complete statement -- there are no token deltas to stream. `useCitizenVoice` instead meters characters out against `outCtx.currentTime`, bounded by `MAX_REVEAL_CHARS_PER_SEC`, so words surface as they're spoken. Snaps to full on `AgentAudioDone`; freezes mid-sentence on barge-in, because that's what the citizen actually got to say. |
 
 ## Known Limitations
 
 - No stream reconnect mid-build (server loop completes, can't re-attach)
-- Zone sessions not interruptible from UI
+- Zone sessions not interruptible from UI; Zones still run on Managed Agents
 - Single-user demo (module-level session Map, per-process)
-- Agent config changes require deleting `*_AGENT_ID` and restarting
-- No SDK knob to disable extended thinking on Managed Agents (model swap is the workaround)
+- Direct runtime interrupts land at turn boundaries, not mid-turn
 - Filename casing: data files lowercase, components PascalCase (cross-platform safety)
+
+**Resolved** (don't reintroduce these workarounds):
+- ~~No SDK knob to disable extended thinking~~ -- the direct runtime sets `thinking` per request. This was the single largest source of build latency.
+- ~~Agent config changes require deleting `*_AGENT_ID` and restarting~~ -- `ensureMayor()` reconciles via `agents.update()`.
+- ~~Tailwind padding/margin utilities silently do nothing~~ -- `globals.css` had a hand-written `* { margin: 0; padding: 0 }` reset. Tailwind v4 puts utilities in `@layer utilities`, and **unlayered CSS outranks any layered rule regardless of specificity**, so that one line zeroed out every `p-*` and `m-*` class app-wide. Preflight already applies the same reset inside `@layer base`. Don't add a bare `*` reset after `@import "tailwindcss"`.

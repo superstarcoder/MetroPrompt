@@ -4,6 +4,7 @@ import { useEffect, useRef } from 'react';
 import type { RefObject } from 'react';
 import type { City, Property } from '@/lib/all_types';
 import { gridToScreen } from './constants';
+import { businessBlurb } from '@/lib/sim/companies';
 import { PROPERTY_LABELS } from './propertyLabels';
 
 type Props = {
@@ -53,6 +54,9 @@ export function PropertyInfoPopup({ property, cityRef, worldRef, onClose, canDis
   const label = PROPERTY_LABELS[property.name] ?? property.name;
   const heading = property.company_name ? `${property.company_name}` : label;
   const subhead = property.company_name ? label : null;
+  // Same one-liner the citizens get in their prompt — showing it here means
+  // the user can see exactly what a citizen knows before asking them about it.
+  const blurb = businessBlurb(property);
 
   return (
     <div
@@ -98,6 +102,9 @@ export function PropertyInfoPopup({ property, cityRef, worldRef, onClose, canDis
           </button>
         </div>
       </div>
+      {blurb && (
+        <div className="text-white/55 italic mb-2 leading-snug">{blurb}</div>
+      )}
       <div className="flex justify-between mb-2 text-white/70">
         <span>Inside</span>
         <span className="tabular-nums">

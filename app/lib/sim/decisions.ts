@@ -1,8 +1,8 @@
-import type { City, Person, Property } from '@/lib/all_types';
+import type { City, NeedName, Person, Property, UnmetWant } from '@/lib/all_types';
 import { DECISION_WEIGHTS } from './constants';
 import { planPathToProperty } from './pathfinding';
 
-type Need = 'hunger' | 'boredom' | 'tiredness';
+type Need = NeedName;
 
 function highestNeed(c: Person): Need {
   if (c.hunger >= c.boredom && c.hunger >= c.tiredness) return 'hunger';
@@ -59,6 +59,42 @@ export function pickDestination(citizen: Person, city: City): Property | null {
     : pickRandomDestination(citizen, city);
 }
 
+// A want only counts as unmet once it's actually pressing. Below this the
+// citizen has a mild preference, not a complaint worth reporting to a mayor.
+const UNMET_NEED_THRESHOLD = 7;
+
+// Needs a PUBLIC amenity is expected to answer. Tiredness is excluded on
+// purpose: home gives tiredness_decrease 10, more than any hospital, so
+// sleeping at home is the correct answer rather than a gap in the city. Left
+// in, it would fire in every city without a hospital and swamp the signal.
+const PUBLIC_NEEDS: readonly Need[] = ['hunger', 'boredom'];
+
+// Does anything OTHER than the citizen's own home address this need?
+//
+// Home is excluded deliberately. It serves all three needs (hunger 5,
+// boredom 2, tiredness 10), so counting it would make this always true and
+// the check dead code. The question worth asking a city planner is not "can
+// this person eat at all" but "does the city offer anywhere to eat".
+function cityCanServeNeed(citizen: Person, city: City, need: Need): boolean {
+  return city.all_properties.some(
+    p => p !== citizen.home && isValidDestination(citizen, p) && decreaseFor(p, need) > 0,
+  );
+}
+
+// Records an unmet want ONCE per (need, reason), bumping a counter on repeats.
+// Idle citizens re-decide every tick, so appending a row per failure would
+// produce thousands of duplicates and drown out the actual signal.
+function recordUnmetWant(citizen: Person, need: Need, reason: UnmetWant['reason'], tick: number): void {
+  const wants = (citizen.unmet_wants ??= []);
+  const existing = wants.find(w => w.need === need && w.reason === reason);
+  if (existing) {
+    existing.count += 1;
+    existing.last_tick = tick;
+    return;
+  }
+  wants.push({ need, reason, first_tick: tick, last_tick: tick, count: 1 });
+}
+
 // True iff `pos` is 4-adjacent to any cell of the property's footprint.
 // This is the entry-tile predicate used by runTick to detect arrival.
 export function isAtEntryTile(pos: { x: number; y: number }, p: Property): boolean {
@@ -87,9 +123,27 @@ export function assignDestination(
   currentTick: number,
   maxAttempts = 8,
 ): void {
+  // Checked before the attempt loop so it reflects the CITY, not which way the
+  // 70/30 optimal-vs-random roll happened to land this tick.
+  const need = highestNeed(citizen);
+  if (
+    citizen[need] >= UNMET_NEED_THRESHOLD &&
+    PUBLIC_NEEDS.includes(need) &&
+    !cityCanServeNeed(citizen, city, need)
+  ) {
+    recordUnmetWant(citizen, need, 'no_option', currentTick);
+    // Deliberately not returning: the citizen still goes somewhere (usually
+    // home). The want is logged either way — settling isn't the same as
+    // being satisfied.
+  }
+
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const target = pickDestination(citizen, city);
-    if (!target) return;
+    if (!target) {
+      // Nowhere valid to go at all — not even home.
+      recordUnmetWant(citizen, need, 'no_option', currentTick);
+      return;
+    }
 
     const path = planPathToProperty(
       citizen.current_location,
@@ -116,5 +170,7 @@ export function assignDestination(
     });
     return;
   }
-  // Couldn't find a movable destination this tick — retry next tick.
+  // Every attempt found a destination but none was walkable. Buildings exist;
+  // the road network is what failed. Retry next tick — but log it once.
+  recordUnmetWant(citizen, need, 'unreachable', currentTick);
 }

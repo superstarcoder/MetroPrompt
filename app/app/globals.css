@@ -1,10 +1,12 @@
 @import "tailwindcss";
 
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
-}
+/* No `* { margin: 0; padding: 0; box-sizing: border-box }` here on purpose.
+   Tailwind v4's preflight already applies exactly that reset, and it does so
+   inside `@layer base`. A hand-written copy of it sits UNLAYERED, and
+   unlayered CSS outranks every layered rule regardless of specificity — so it
+   silently beat `@layer utilities` and zeroed out every padding and margin
+   utility in the app. Padding classes appeared to do nothing, no matter what
+   value they were given. Don't reintroduce it. */
 
 html, body {
   width: 100%;

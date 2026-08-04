@@ -1,4 +1,4 @@
-import { runMayorLoop, getSession } from '@/lib/agent/mayor';
+import { runMayorBuild, getSession } from '@/lib/agent/mayor';
 import type { MayorStreamEvent } from '@/lib/agent/mayor';
 
 // Next.js: never cache, always run at request time.
@@ -35,7 +35,7 @@ export async function GET(
       };
 
       try {
-        await runMayorLoop(sessionId, send);
+        await runMayorBuild(sessionId, send);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         console.error('[api/mayor stream]', msg);
