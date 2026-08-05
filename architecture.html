@@ -1,0 +1,1639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MetroPrompt Architecture</title>
+<style>
+/* Single file, no dependencies.
+   Each tab is a fixed-width panel drawn inside one pan/zoom canvas; the
+   canvas is transformed, never the layout, so flows never reflow while
+   you zoom. Per-tab camera state is remembered on switch. */
+
+:root {
+  --bg:        #f6f7f9;
+  --surface:   #ffffff;
+  --line:      #e4e7ec;
+  --line-2:    #d0d5dd;
+  --fg:        #17202e;
+  --fg-2:      #5a6473;
+  --fg-3:      #98a2b3;
+
+  --browser:   #0284c7;
+  --server:    #059669;
+  --anthropic: #d97706;
+  --deepgram:  #7c3aed;
+  --data:      #52627a;
+
+  /* Header tints, one per zone. Explicit rather than color-mix so the file
+     has no browser-version floor. */
+  --browser-t:   #e8f4fd;
+  --server-t:    #e6f7f1;
+  --anthropic-t: #fdf3e3;
+  --deepgram-t:  #f2ecfe;
+  --data-t:      #eef1f5;
+
+  --arrow:     #6b7688;
+
+  --shadow:    0 1px 2px rgba(16,24,40,.04), 0 2px 6px rgba(16,24,40,.05);
+  --shadow-lg: 0 2px 4px rgba(16,24,40,.05), 0 10px 22px rgba(16,24,40,.10);
+  --radius: 10px;
+
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ---------- chrome ---------- */
+
+.chrome { flex: 0 0 auto; background: var(--surface); border-bottom: 1px solid var(--line); }
+.chrome-inner { max-width: 1560px; margin: 0 auto; padding: 0 22px; }
+
+.titlebar {
+  display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+  padding: 16px 0 12px;
+}
+h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -0.4px; }
+h1 .accent { color: var(--deepgram); }
+.tagline { margin: 0; color: var(--fg-2); font-size: 13px; }
+.facts { margin-left: auto; display: flex; gap: 16px; flex-wrap: wrap; }
+.facts div { font-size: 12px; color: var(--fg-3); }
+.facts b { color: var(--fg); font-weight: 600; }
+
+/* tabs */
+.tabs { display: flex; gap: 2px; flex-wrap: wrap; }
+.tab {
+  font-family: inherit; font-size: 13.5px;
+  background: none; border: 0; border-bottom: 2px solid transparent;
+  padding: 9px 14px 10px; cursor: pointer; color: var(--fg-2);
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.tab:hover { color: var(--fg); }
+.tab .idx {
+  font-size: 11px; font-weight: 600; color: var(--fg-3);
+  background: #f1f3f6; border-radius: 5px; padding: 1px 6px;
+}
+.tab[aria-selected="true"] { color: var(--fg); font-weight: 600; border-bottom-color: var(--deepgram); }
+.tab[aria-selected="true"] .idx { background: #f3eeff; color: var(--deepgram); }
+
+/* toolbar */
+.toolbar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 9px 0 11px; border-top: 1px solid var(--line);
+}
+.toolbar .label { font-size: 12px; color: var(--fg-3); }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.chip, .btn {
+  font-family: inherit; font-size: 12.5px;
+  padding: 5px 11px; border-radius: 999px;
+  border: 1px solid var(--line-2); background: var(--surface);
+  color: var(--fg-2); cursor: pointer;
+  display: inline-flex; align-items: center; gap: 7px;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.chip:hover, .btn:hover { border-color: var(--fg-3); color: var(--fg); }
+.chip .swatch { width: 8px; height: 8px; border-radius: 50%; }
+.chip[data-zone="browser"]   .swatch { background: var(--browser); }
+.chip[data-zone="server"]    .swatch { background: var(--server); }
+.chip[data-zone="anthropic"] .swatch { background: var(--anthropic); }
+.chip[data-zone="deepgram"]  .swatch { background: var(--deepgram); }
+.chip[data-zone="data"]      .swatch { background: var(--data); }
+.chip[aria-pressed="true"] { color: #fff; border-color: transparent; }
+.chip[data-zone="browser"][aria-pressed="true"]   { background: var(--browser); }
+.chip[data-zone="server"][aria-pressed="true"]    { background: var(--server); }
+.chip[data-zone="anthropic"][aria-pressed="true"] { background: var(--anthropic); }
+.chip[data-zone="deepgram"][aria-pressed="true"]  { background: var(--deepgram); }
+.chip[data-zone="data"][aria-pressed="true"]      { background: var(--data); }
+.chip[aria-pressed="true"] .swatch { background: #fff; }
+
+.zoomgroup { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+.btn.icon { width: 30px; padding: 0; justify-content: center; height: 28px; border-radius: 8px; font-size: 15px; }
+.zoomval {
+  font-family: var(--mono); font-size: 12px; color: var(--fg-3);
+  min-width: 48px; text-align: center;
+}
+.hint { font-size: 12px; color: var(--fg-3); }
+
+/* ---------- pan / zoom viewport ---------- */
+
+.viewport {
+  flex: 1 1 auto; position: relative; overflow: hidden;
+  cursor: grab; touch-action: none;
+  background-color: var(--bg);
+  background-image: radial-gradient(circle, #dfe3ea 1px, transparent 1px);
+  background-size: 22px 22px;
+  /* Nothing inside the canvas is selectable: a drag should always pan, never
+     start a text selection. */
+  -webkit-user-select: none;
+  user-select: none;
+}
+.viewport.grabbing { cursor: grabbing; }
+.viewport.grabbing .node { pointer-events: none; }
+
+#canvas { position: absolute; top: 0; left: 0; transform-origin: 0 0; will-change: transform; }
+
+.panel { display: none; width: 1360px; padding: 6px 2px 40px; }
+.panel.active { display: block; }
+
+.panel-hd { margin-bottom: 4px; }
+.panel-hd h2 { margin: 0; font-size: 22px; font-weight: 650; letter-spacing: -0.4px; }
+.panel-hd p { margin: 8px 0 0; color: var(--fg-2); max-width: 92ch; }
+
+.flow-title {
+  font-size: 12px; color: var(--fg-3);
+  margin: 26px 0 10px; text-transform: uppercase; letter-spacing: .6px;
+}
+
+/* ---------- flows ---------- */
+
+.flow { display: flex; align-items: stretch; flex-wrap: wrap; margin-bottom: 12px; }
+
+/* Connector: a drawn rule with the glyph sitting in the middle of it, so an
+   arrow reads as a line between two cards rather than a floating character. */
+.link {
+  flex: 0 0 auto; align-self: center;
+  display: flex; flex-direction: column; align-items: stretch; justify-content: center;
+  padding: 0 4px; min-width: 84px;
+}
+.link .glyph {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 17px; line-height: 1; font-weight: 600;
+  color: var(--arrow);
+}
+.link .glyph::before, .link .glyph::after {
+  content: ''; flex: 1 1 auto; height: 2px; border-radius: 2px;
+  background: currentColor; opacity: .55;
+}
+.link .proto {
+  font-size: 10.5px; color: var(--fg-2); text-align: center;
+  margin-top: 5px; line-height: 1.35;
+}
+.link.strong .glyph { color: var(--deepgram); }
+.link.strong .glyph::before, .link.strong .glyph::after { opacity: .7; height: 3px; }
+.link.strong .proto { color: var(--deepgram); font-weight: 500; }
+
+/* ---------- cards ---------- */
+
+.node {
+  --zc: var(--data);
+  --zt: var(--data-t);
+  flex: 1 1 190px; min-width: 176px; max-width: 320px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  cursor: pointer;
+  transition: box-shadow .16s ease, transform .12s ease, border-color .16s ease, opacity .14s;
+}
+.node:hover {
+  box-shadow: var(--shadow-lg);
+  transform: translateY(-2px);
+  border-color: var(--zc);
+}
+.node[data-zone="browser"]   { --zc: var(--browser);   --zt: var(--browser-t); }
+.node[data-zone="server"]    { --zc: var(--server);    --zt: var(--server-t); }
+.node[data-zone="anthropic"] { --zc: var(--anthropic); --zt: var(--anthropic-t); }
+.node[data-zone="deepgram"]  { --zc: var(--deepgram);  --zt: var(--deepgram-t); }
+.node[data-zone="data"]      { --zc: var(--data);      --zt: var(--data-t); }
+
+/* Tinted header strip carries the zone colour; the dot repeats it at small
+   size so the card still reads when the filter dims everything else. */
+.node .ttl {
+  font-size: 14px; font-weight: 600; letter-spacing: -0.2px;
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 13px;
+  background: var(--zt);
+  border-bottom: 1px solid var(--line);
+}
+.node .ttl::before {
+  content: ''; flex: 0 0 auto;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--zc);
+  box-shadow: 0 0 0 3px rgba(255,255,255,.7);
+}
+.node .ttl .caret {
+  font-size: 9px; color: var(--fg-3); flex: 0 0 auto;
+  margin-left: auto; transition: color .14s;
+}
+.node:hover .ttl .caret { color: var(--zc); }
+
+.node .file {
+  font-family: var(--mono); font-size: 10.5px; color: var(--fg-2);
+  margin: 12px 13px 0; padding: 4px 7px;
+  background: #f4f6f8; border-radius: 6px;
+  display: inline-block; word-break: break-word; line-height: 1.4;
+}
+.node .file .loc { color: var(--fg-3); }
+.node .sub { font-size: 12.5px; color: var(--fg-2); margin: 8px 13px 13px; }
+
+.node .detail {
+  display: none;
+  margin: 0 13px 13px; padding-top: 11px;
+  border-top: 1px solid var(--line);
+  font-size: 12.5px; color: var(--fg-2);
+}
+.node.open .detail { display: block; }
+.node.open .sub { margin-bottom: 0; }   /* detail supplies the gap instead */
+.node .detail ul { margin: 0; padding-left: 17px; }
+.node .detail li { margin-bottom: 5px; }
+.node .detail li:last-child { margin-bottom: 0; }
+.node .detail code, td code, .callout code, .panel-hd code {
+  font-family: var(--mono); font-size: 11.5px;
+  background: #f1f3f6; border-radius: 4px; padding: 1px 4px; color: var(--fg);
+}
+.node .detail .files { margin-top: 9px; }
+.node .detail .files span {
+  display: block; font-family: var(--mono); font-size: 10.5px;
+  color: var(--fg-3); word-break: break-word;
+}
+
+body.filtering .node.dim,
+body.filtering .link.dim,
+body.filtering .stack.dim { opacity: .16; }
+
+/* ---------- fan-out ---------- */
+
+.stack {
+  flex: 1 1 190px; min-width: 176px; max-width: 320px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.stack .node { max-width: none; flex: 0 0 auto; }
+.stack .stack-note {
+  font-size: 11.5px; color: var(--fg-2); text-align: center;
+  border: 1px dashed var(--line-2); border-radius: 12px; padding: 7px;
+  background: rgba(255,255,255,.6);
+}
+
+/* ---------- callouts ---------- */
+
+.callout {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--deepgram);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 14px 16px; margin: 20px 0 0;
+  color: var(--fg-2); max-width: 92ch;
+}
+.callout b { color: var(--fg); font-weight: 600; }
+.callout.amber { border-left-color: var(--anthropic); }
+.callout.green { border-left-color: var(--server); }
+.callout .tag {
+  display: block; font-size: 11px; color: var(--fg-3);
+  text-transform: uppercase; letter-spacing: .6px; margin-bottom: 5px;
+}
+
+.boundary {
+  display: flex; align-items: center; gap: 14px;
+  margin: 22px 0; color: var(--anthropic); font-size: 12.5px; font-weight: 500;
+}
+.boundary::before, .boundary::after { content: ''; flex: 1; border-top: 1px dashed #f0c66a; }
+
+/* ---------- table ---------- */
+
+.tbl {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  overflow: hidden; margin: 18px 0 0;
+}
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 11px 15px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+th { color: var(--fg-3); font-size: 11.5px; font-weight: 500; text-transform: uppercase; letter-spacing: .6px; }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover { background: #fafbfc; }
+</style>
+</head>
+<body>
+
+<div class="chrome">
+  <div class="chrome-inner">
+    <div class="titlebar">
+      <h1>Metro<span class="accent">Prompt</span></h1>
+      <p class="tagline">How the agentic city builder fits together</p>
+      <div class="facts">
+        <div><b>60</b> modules</div>
+        <div><b>~11.6k</b> lines</div>
+        <div><b>4</b> agents</div>
+        <div><b>50×50</b> grid</div>
+      </div>
+    </div>
+
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" data-panel="build"      aria-selected="true"><span class="idx">01</span>Build</button>
+      <button class="tab" role="tab" data-panel="simulate"   aria-selected="false"><span class="idx">02</span>Simulate</button>
+      <button class="tab" role="tab" data-panel="interview"  aria-selected="false"><span class="idx">03</span>Interview</button>
+      <button class="tab" role="tab" data-panel="debrief"    aria-selected="false"><span class="idx">04</span>Debrief</button>
+      <button class="tab" role="tab" data-panel="schema"     aria-selected="false"><span class="idx">◈</span>Schema</button>
+      <button class="tab" role="tab" data-panel="foundation" aria-selected="false"><span class="idx">◇</span>Foundation</button>
+      <button class="tab" role="tab" data-panel="agents"     aria-selected="false"><span class="idx">◆</span>Agents</button>
+    </div>
+
+    <div class="toolbar">
+      <span class="label">Where it runs</span>
+      <div class="chips" id="chips">
+        <button class="chip" data-zone="browser"   aria-pressed="false"><span class="swatch"></span>Browser</button>
+        <button class="chip" data-zone="server"    aria-pressed="false"><span class="swatch"></span>Next.js server</button>
+        <button class="chip" data-zone="anthropic" aria-pressed="false"><span class="swatch"></span>Anthropic</button>
+        <button class="chip" data-zone="deepgram"  aria-pressed="false"><span class="swatch"></span>Deepgram</button>
+        <button class="chip" data-zone="data"      aria-pressed="false"><span class="swatch"></span>Shared data</button>
+      </div>
+      <button class="btn" id="expandAll">Expand all</button>
+      <button class="btn" id="collapseAll">Collapse all</button>
+
+      <div class="zoomgroup">
+        <span class="hint">drag to pan · scroll to zoom</span>
+        <button class="btn icon" id="zoomOut" title="Zoom out (-)">-</button>
+        <span class="zoomval" id="zoomVal">100%</span>
+        <button class="btn icon" id="zoomIn" title="Zoom in (+)">+</button>
+        <button class="btn" id="fitBtn" title="Fit to view (0)">Fit</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="viewport" id="viewport">
+  <div id="canvas">
+
+    <!-- ================================================== BUILD -->
+    <section class="panel active" id="panel-build">
+      <div class="panel-hd">
+        <h2>Build</h2>
+        <p>
+          You type a goal. The Mayor lays the road grid, splits the map into 4-8 rectangles, and fans them
+          out to Zone agents in parallel. Every change is a validated tool call, and each one is streamed to
+          the browser as it lands.
+        </p>
+      </div>
+
+      <div class="flow-title">Session setup</div>
+      <div class="flow">
+        <div class="node" data-zone="browser">
+          <div class="ttl">Chat panel<span class="caret">▸</span></div>
+          <div class="file">components/city/ChatPanel.tsx <span class="loc">334</span></div>
+          <div class="sub">Draggable panel with the message feed and composer.</div>
+          <div class="detail">
+            <ul>
+              <li>Composer has four states: idle, running, paused, done.</li>
+              <li>Tool cards are styled by <code>feedHelpers.ts</code>.</li>
+            </ul>
+            <div class="files"><span>components/city/streamTypes.ts</span></div>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">POST</span></div>
+
+        <div class="node" data-zone="server">
+          <div class="ttl">Create session<span class="caret">▸</span></div>
+          <div class="file">app/api/mayor/route.ts</div>
+          <div class="sub">Mints a session id, stored in a module-level Map.</div>
+          <div class="detail">
+            <ul>
+              <li>Direct runtime: just a UUID, and config rides on each request.</li>
+              <li>Sessions survive <code>finish</code>, so follow-ups reuse the transcript.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">EventSource</span></div>
+
+        <div class="node" data-zone="server">
+          <div class="ttl">SSE stream<span class="caret">▸</span></div>
+          <div class="file">app/api/mayor/[sessionId]/stream/route.ts <span class="loc">61</span></div>
+          <div class="sub">Drives the agent loop and emits events.</div>
+          <div class="detail">
+            <ul>
+              <li>Siblings: <code>/interrupt</code>, <code>/message</code>, <code>/followup</code>.</li>
+              <li>Closes on <code>done</code>, otherwise EventSource reconnects into a zombie loop.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-title">The Mayor loop</div>
+      <div class="flow">
+        <div class="node" data-zone="server">
+          <div class="ttl">Mayor<span class="caret">▸</span></div>
+          <div class="file">lib/agent/mayor.ts <span class="loc">1408</span></div>
+          <div class="sub">Prompts, tuning knobs, tool dispatch, both runtime loops.</div>
+          <div class="detail">
+            <ul>
+              <li><code>claude-opus-5</code>, effort <code>low</code>, thinking adaptive.</li>
+              <li>Runtime is <code>direct</code>, so we own the loop over <code>messages.stream()</code>.</li>
+              <li><code>dispatchMayorTool()</code> holds all tool handling, so both runtimes run the same code.</li>
+              <li>Two prompt versions live side by side for A/B.</li>
+            </ul>
+            <div class="files">
+              <span>lib/agent/observation.ts: city → text</span>
+              <span>scripts/bench-mayor.mjs: build benchmark</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">↔</span><span class="proto">Messages API</span></div>
+
+        <div class="node" data-zone="anthropic">
+          <div class="ttl">claude-opus-5<span class="caret">▸</span></div>
+          <div class="file">effort low · thinking adaptive</div>
+          <div class="sub">Up to ~70 tool calls in a single build.</div>
+          <div class="detail">
+            <ul>
+              <li>Thinking has to stay on. With it disabled, a tool call can end up in visible text instead of a <code>tool_use</code> block, and silently never run.</li>
+              <li>So effort is the cost lever instead. <code>temperature</code> and friends are rejected outright.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">tool_use</span></div>
+
+        <div class="node" data-zone="server">
+          <div class="ttl">Tool layer<span class="caret">▸</span></div>
+          <div class="file">lib/agent/tools.ts <span class="loc">575</span></div>
+          <div class="sub">Schemas, handlers, and <code>applyToolCall</code>. Throws on overlap or OOB.</div>
+          <div class="detail">
+            <ul>
+              <li>Models can't reliably emit a clean 50×50 ASCII grid, but they're good at structured tool calls. That's the core bet.</li>
+              <li>Grass-only rule: footprints must be all grass.</li>
+              <li>Every tool id is tracked, and unanswered ones are drained with errors so a session never wedges.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-title">Zone fan-out</div>
+      <div class="flow">
+        <div class="node" data-zone="server">
+          <div class="ttl">delegate_zones<span class="caret">▸</span></div>
+          <div class="file">lib/agent/zone.ts <span class="loc">503</span></div>
+          <div class="sub">Trims each bbox, then <code>Promise.allSettled</code>.</div>
+          <div class="detail">
+            <ul>
+              <li>Boxes are trimmed inward past road edges first, so a Zone can't overwrite the Mayor's roads.</li>
+              <li>Non-overlapping boxes make concurrent mutation safe without locking.</li>
+              <li>The bbox is re-checked on every Zone tool call, not just at dispatch.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">⇒</span><span class="proto">parallel</span></div>
+
+        <div class="stack" data-zone="anthropic">
+          <div class="node" data-zone="anthropic">
+            <div class="ttl">Zone agent<span class="caret">▸</span></div>
+            <div class="file">claude-haiku-4-5 · Managed Agents</div>
+            <div class="sub">Fills one box with buildings and nature, then finishes.</div>
+            <div class="detail">
+              <ul>
+                <li>Haiku on purpose. Sonnet burned 20k+ tokens deliberating on simple fills.</li>
+                <li>Haiku rejects <code>effort</code>, so it's never set here.</li>
+              </ul>
+            </div>
+          </div>
+          <div class="node" data-zone="anthropic">
+            <div class="ttl">Zone agent<span class="caret">▸</span></div>
+            <div class="file">7 of the 14 tools</div>
+            <div class="sub">No delegation, no deletion.</div>
+            <div class="detail">A bad Zone can only fail to fill its own rectangle.</div>
+          </div>
+          <div class="stack-note">up to 8 in parallel</div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">SSE</span></div>
+
+        <div class="node" data-zone="browser">
+          <div class="ttl">useMayorSession<span class="caret">▸</span></div>
+          <div class="file">components/city/useMayorSession.ts <span class="loc">342</span></div>
+          <div class="sub">Applies each streamed tool call and repaints.</div>
+          <div class="detail">
+            <ul>
+              <li>Owns status, feed, and the four actions: build, follow-up, pause, redirect.</li>
+              <li>Interrupts land at turn boundaries, since stopping mid-turn would orphan a <code>tool_use</code> block.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">render</span></div>
+
+        <div class="node" data-zone="browser">
+          <div class="ttl">Pixi scene<span class="caret">▸</span></div>
+          <div class="file">components/city/useCityScene.ts <span class="loc">734</span></div>
+          <div class="sub">App, layers, painter loop, pan and zoom.</div>
+          <div class="detail">
+            <ul>
+              <li>Isometric: <code>(gx-gy)*32, (gx+gy)*16</code>.</li>
+              <li>Two passes: ground tiles, then nature and buildings sorted by <code>x+y</code>.</li>
+              <li>Repaints coalesce into one animation frame.</li>
+            </ul>
+            <div class="files">
+              <span>components/CityRenderer.tsx (523)</span>
+              <span>components/city/useCityEditor.ts (208)</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout amber">
+        <span class="tag">Why the direct runtime exists</span>
+        Owning the loop bought almost nothing on its own. Platform overhead was about 5% of wall time. The
+        win came from being able to turn <b>thinking off</b>, which Managed Agents can't express: 3× faster
+        builds and 78% fewer tokens on the old Sonnet config. Those numbers predate the Opus 5 swap.
+      </div>
+    </section>
+
+    <!-- ================================================== SIMULATE -->
+    <section class="panel" id="panel-simulate">
+      <div class="panel-hd">
+        <h2>Simulate</h2>
+        <p>
+          The finished city gets populated. Citizens have decaying needs, pick a destination that serves
+          them, and walk there. Fires break out and a truck is dispatched. All of this is plain TypeScript,
+          with no LLM calls.
+        </p>
+      </div>
+
+      <div class="flow-title">The tick</div>
+      <div class="flow">
+        <div class="node" data-zone="browser">
+          <div class="ttl">Tick driver<span class="caret">▸</span></div>
+          <div class="file">components/city/useSimulation.ts <span class="loc">480</span></div>
+          <div class="sub">Needs decay, movement, fire response, run state.</div>
+          <div class="detail">
+            <ul>
+              <li><code>stopSim()</code> clears the citizens; <code>endSim()</code> just freezes the world. The report needs the second one.</li>
+              <li><code>fireLog</code> is run-scoped, not saved with the city.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">spawn</span></div>
+
+        <div class="node" data-zone="server">
+          <div class="ttl">Spawning<span class="caret">▸</span></div>
+          <div class="file">lib/sim/spawning.ts <span class="loc">54</span></div>
+          <div class="sub">Populates the city with citizens.</div>
+          <div class="detail">
+            <ul>
+              <li>Gender is rolled first, then the name comes from that pool, which keeps the name, voice, and sprite in agreement.</li>
+              <li>Unisex names sit in both pools, which is why gender is stored rather than guessed from the name.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">each tick</span></div>
+
+        <div class="node" data-zone="server">
+          <div class="ttl">Decisions<span class="caret">▸</span></div>
+          <div class="file">lib/sim/decisions.ts <span class="loc">176</span></div>
+          <div class="sub">Picks a destination, and records it when none exists.</div>
+          <div class="detail">
+            <ul>
+              <li>A citizen's own home is excluded from the check, because a house serves hunger and counting it made the check always false.</li>
+              <li>Tiredness is excluded too: home beats a hospital for sleep, so that's not a gap.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">route</span></div>
+
+        <div class="node" data-zone="server">
+          <div class="ttl">Pathfinding<span class="caret">▸</span></div>
+          <div class="file">lib/sim/pathfinding.ts <span class="loc">256</span></div>
+          <div class="sub"><b>A*</b> on a 4-connected grid, Manhattan heuristic.</div>
+          <div class="detail">
+            <ul>
+              <li>Every step costs 1, so the Manhattan heuristic is admissible and consistent. Closed cells are never reopened.</li>
+              <li>Hand-rolled binary min-heap for the open set, and cells keyed as a single int (<code>y * w + x</code>) so the score maps stay flat.</li>
+              <li>No decrease-key: an improved cell is pushed again and stale copies are skipped on pop.</li>
+              <li><code>nearestEntryTile</code> is a plain BFS out from a building's footprint. It turns a 3x3 building into the single point A* can target.</li>
+              <li>Grass is walkable, so an unreachable citizen is genuinely boxed in, usually ringed by road tiles.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">dispatch</span></div>
+
+        <div class="node" data-zone="server">
+          <div class="ttl">Firetruck<span class="caret">▸</span></div>
+          <div class="file">lib/sim/firetruck.ts <span class="loc">178</span></div>
+          <div class="sub">Dispatch and response-time tracking.</div>
+          <div class="detail">
+            <ul>
+              <li>Reuses the same <code>findPath</code> A*, just handed a <b>drivability</b> grid instead of a walkability one: roads, intersections and crosswalks only.</li>
+              <li>A record is written on arrival, not on dispatch.</li>
+              <li>Crosswalk is the only tile that's both walkable and drivable, so a sidewalk across a road cuts the truck off. The Mayor prompt covers this.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-title">Data and live UI</div>
+      <div class="flow">
+        <div class="node" data-zone="data">
+          <div class="ttl">Sim constants<span class="caret">▸</span></div>
+          <div class="file">lib/sim/constants.ts <span class="loc">174</span></div>
+          <div class="sub">Tick rates, decay distributions, thresholds.</div>
+          <div class="detail">Decay rates are drawn per person, so two citizens with the same job drift apart over a run.</div>
+        </div>
+
+        <div class="link"><span class="glyph">·</span></div>
+
+        <div class="node" data-zone="data">
+          <div class="ttl">Companies<span class="caret">▸</span></div>
+          <div class="file">lib/sim/companies.ts <span class="loc">178</span></div>
+          <div class="sub">30 companies with one-liners, 20 named restaurants.</div>
+          <div class="detail">
+            <ul>
+              <li>Hand-written, not generated. The set is small and the names are recognisable enough that invented blurbs would be worse.</li>
+              <li>Restaurants reuse <code>company_name</code>, so no schema change was needed.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">·</span></div>
+
+        <div class="node" data-zone="browser">
+          <div class="ttl">Live popups<span class="caret">▸</span></div>
+          <div class="file">components/city/*Popup.tsx</div>
+          <div class="sub">Citizen needs, property details, response times.</div>
+          <div class="detail">
+            <div class="files">
+              <span>CitizenStatsPopup.tsx (154)</span>
+              <span>PropertyInfoPopup.tsx (131)</span>
+              <span>ResponseTimePopup.tsx (142)</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout green">
+        <span class="tag">Unmet wants</span>
+        A trip that never happens leaves no trace, so the sim used to throw away its most useful signal.
+        Failures are now recorded as either <b>no_option</b> (build the thing) or <b>unreachable</b> (fix the
+        roads), deduped with a counter, because idle citizens re-decide every tick and appending each
+        time would bury it.
+      </div>
+    </section>
+
+    <!-- ================================================== INTERVIEW -->
+    <section class="panel" id="panel-interview">
+      <div class="panel-hd">
+        <h2>Interview a citizen</h2>
+        <p>
+          Click a citizen and ask them about the city. The same persona feeds a text route and a full-duplex
+          voice session. On the voice side Deepgram owns the whole speech loop (transcription, model,
+          speech, turn detection, barge-in) over one socket.
+        </p>
+      </div>
+
+      <div class="flow-title">Text</div>
+      <div class="flow">
+        <div class="node" data-zone="browser">
+          <div class="ttl">Click to chat<span class="caret">▸</span></div>
+          <div class="file">components/city/citizenChat.ts <span class="loc">168</span></div>
+          <div class="sub">Builds the context from a Person and posts it.</div>
+          <div class="detail">
+            <div class="files">
+              <span>hitTesting.ts: screenToGrid, entityAt</span>
+              <span>CitizenSpeechBubble.tsx (160)</span>
+            </div>
+          </div>
+        </div>
+        <div class="link"><span class="glyph">→</span><span class="proto">POST</span></div>
+        <div class="node" data-zone="server">
+          <div class="ttl">/api/citizen-chat<span class="caret">▸</span></div>
+          <div class="file">app/api/citizen-chat/route.ts <span class="loc">95</span></div>
+          <div class="sub"><code>claude-haiku-4-5</code>, grounded in the trip log.</div>
+          <div class="detail">Rejects an empty reply with a 502 rather than rendering a blank bubble.</div>
+        </div>
+        <div class="link"><span class="glyph">→</span><span class="proto">prompt</span></div>
+        <div class="node" data-zone="data">
+          <div class="ttl">Citizen persona<span class="caret">▸</span></div>
+          <div class="file">lib/agent/citizenPrompt.ts <span class="loc">253</span></div>
+          <div class="sub">One source, shared by text and voice.</div>
+          <div class="detail">
+            <ul>
+              <li>Carries their employer, the named restaurants, and a directory of what actually got built.</li>
+              <li>Listing what exists also says what doesn't, so a citizen with no hospital says so instead of inventing one.</li>
+              <li>Personal details are improvised per reply, so they're consistent within a chat but not across chats.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-title">Voice: getting a token</div>
+      <div class="flow">
+        <div class="node" data-zone="browser">
+          <div class="ttl">VoiceChatBar<span class="caret">▸</span></div>
+          <div class="file">components/city/VoiceChatBar.tsx <span class="loc">114</span></div>
+          <div class="sub">Button, status, mute, and a 24-bar visualizer.</div>
+          <div class="detail">The analyser sits on the playback path, so the bars move only when the citizen actually speaks.</div>
+        </div>
+        <div class="link"><span class="glyph">→</span><span class="proto">POST</span></div>
+        <div class="node" data-zone="server">
+          <div class="ttl">Token route<span class="caret">▸</span></div>
+          <div class="file">app/api/voice-agent/token/route.ts <span class="loc">96</span></div>
+          <div class="sub">Mints a ~60s JWT plus the persona, voice, and keyterms.</div>
+          <div class="detail">The key needs the Member or Owner role. A restricted key passes every other call and 403s on exactly this one, so the route says so explicitly.</div>
+        </div>
+        <div class="link"><span class="glyph">→</span><span class="proto">/v1/auth/grant</span></div>
+        <div class="node" data-zone="deepgram">
+          <div class="ttl">Deepgram auth<span class="caret">▸</span></div>
+          <div class="file">short-lived JWT</div>
+          <div class="sub">Useless once it expires, so it's safe to hand to the page.</div>
+          <div class="detail">The SDK is used here for minting only, not for the socket.</div>
+        </div>
+      </div>
+
+      <div class="boundary">DEEPGRAM_API_KEY stops here: only the JWT reaches the browser</div>
+
+      <div class="flow-title">Voice: the audio loop</div>
+      <div class="flow">
+        <div class="node" data-zone="browser">
+          <div class="ttl">useVoiceAgent<span class="caret">▸</span></div>
+          <div class="file">components/city/useVoiceAgent.ts <span class="loc">539</span></div>
+          <div class="sub">The transport: socket, mic, playback, transcript. Shared by both agents.</div>
+          <div class="detail">
+            <ul>
+              <li>Native <code>WebSocket</code>, not the SDK's. The SDK passes auth via a third constructor argument that browsers silently drop, so the UI just hangs on "Connecting…".</li>
+              <li>Auth rides the subprotocol: <code>['bearer', jwt]</code>.</li>
+              <li>Settings keys are snake_case. camelCase is ignored and quietly falls back to defaults.</li>
+              <li>Handlers are wired before the socket opens, since greeting audio can arrive within milliseconds.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link strong"><span class="glyph">↔</span><span class="proto">WebSocket<br/>16 kHz PCM</span></div>
+
+        <div class="node" data-zone="deepgram">
+          <div class="ttl">Voice Agent API<span class="caret">▸</span></div>
+          <div class="file">agent.deepgram.com/v1/agent/converse</div>
+          <div class="sub">Flux → Claude → Aura-2, plus turn detection and barge-in.</div>
+          <div class="detail">
+            <ul>
+              <li>Flux needs <code>version: 'v2'</code> on the listen provider, or the model lookup fails.</li>
+              <li>No <code>functions</code> key is ever sent, so neither agent has tools.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link strong"><span class="glyph">→</span><span class="proto">24 kHz PCM</span></div>
+
+        <div class="node" data-zone="browser">
+          <div class="ttl">Playback<span class="caret">▸</span></div>
+          <div class="file">scheduled buffers → analyser → speakers</div>
+          <div class="sub">Audio out, live visualizer, transcript paced to match.</div>
+          <div class="detail">
+            <ul>
+              <li>Text arrives as one complete statement, not token deltas, so characters are metered against the audio clock to surface as they're spoken.</li>
+              <li>Barge-in freezes the text mid-sentence, which is what the citizen actually got to say, and flushes buffered audio.</li>
+              <li>Mute gates the mic send, not the track. No frames reach Deepgram, so barge-in is off by construction.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-title">Per-citizen config</div>
+      <div class="flow">
+        <div class="node" data-zone="browser">
+          <div class="ttl">useCitizenVoice<span class="caret">▸</span></div>
+          <div class="file">components/city/useCitizenVoice.ts <span class="loc">40</span></div>
+          <div class="sub">A 40-line wrapper. Persona config, no protocol.</div>
+          <div class="detail">Its length is the point: the two voice agents differ only in the config the server returns.</div>
+        </div>
+        <div class="link"><span class="glyph">·</span><span class="proto">voice pick</span></div>
+        <div class="node" data-zone="data">
+          <div class="ttl">Voice selection<span class="caret">▸</span></div>
+          <div class="file">pickCitizenVoice(name, gender)</div>
+          <div class="sub">Hash of the name, within their gender's pool.</div>
+          <div class="detail">
+            <ul>
+              <li>A citizen has to sound the same every time or they stop reading as a character. A hash gives that with nothing to persist.</li>
+              <li>Gender is read through a helper that falls back to a name hash, so old saves don't re-roll their voice.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================================================== DEBRIEF -->
+    <section class="panel" id="panel-debrief">
+      <div class="panel-hd">
+        <h2>Mayor debrief</h2>
+        <p>
+          Ending the simulation opens a report built entirely from recorded data. The right half is a live
+          voice session with a second Mayor agent that has no tools, and whose whole context is the finished run.
+        </p>
+      </div>
+
+      <div class="flow-title">From run to prompt</div>
+      <div class="flow">
+        <div class="node" data-zone="browser">
+          <div class="ttl">End simulation<span class="caret">▸</span></div>
+          <div class="file">useSimulation.ts → endSim()</div>
+          <div class="sub">Stops the ticks and freezes the world.</div>
+          <div class="detail">Deliberately not <code>stopSim()</code>, which clears the citizens and would destroy the data the report is built from.</div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">render</span></div>
+
+        <div class="node" data-zone="browser">
+          <div class="ttl">Report<span class="caret">▸</span></div>
+          <div class="file">components/city/SimulationReport.tsx <span class="loc">363</span></div>
+          <div class="sub">Roster on the left, Mayor on the right. No LLM calls here.</div>
+          <div class="detail">
+            <ul>
+              <li>Fire log first: every call with its response time, plus average, fastest, slowest.</li>
+              <li>Then citizen cards, two per row: employer, needs, trips, favourite places, unmet wants.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">aggregate</span></div>
+
+        <div class="node" data-zone="browser">
+          <div class="ttl">Debrief context<span class="caret">▸</span></div>
+          <div class="file">components/city/debriefContext.ts <span class="loc">70</span></div>
+          <div class="sub">Packages the run for the prompt.</div>
+          <div class="detail">Built at connect time, so the Mayor sees the run exactly as it ended.</div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">system prompt</span></div>
+
+        <div class="node" data-zone="data">
+          <div class="ttl">Debrief prompt<span class="caret">▸</span></div>
+          <div class="file">lib/agent/mayorDebriefPrompt.ts <span class="loc">250</span></div>
+          <div class="sub">The Mayor talking to the planner who built the place.</div>
+          <div class="detail">
+            <ul>
+              <li>Leads with a pattern, then the evidence, and always pairs a problem with a buildable fix.</li>
+              <li>Hard 60-word cap. Without it replies ran past 100 words, about forty seconds of audio.</li>
+              <li>Can't invent a resident, business, or statistic.</li>
+              <li>Also exports the model and voice, and builds the keyterm list from business names and residents' first names.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-title">Connecting: same token pattern as the citizens</div>
+      <div class="flow">
+        <div class="node" data-zone="browser">
+          <div class="ttl">useMayorDebriefVoice<span class="caret">▸</span></div>
+          <div class="file">components/city/useMayorDebriefVoice.ts <span class="loc">48</span></div>
+          <div class="sub">The second thin wrapper over the shared transport.</div>
+          <div class="detail">48 lines against a 539-line transport. It builds the report at connect time and hands back a config, nothing else.</div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">POST</span></div>
+
+        <div class="node" data-zone="server">
+          <div class="ttl">Debrief token route<span class="caret">▸</span></div>
+          <div class="file">app/api/voice-agent/mayor-debrief-token/route.ts <span class="loc">93</span></div>
+          <div class="sub">Same JWT mint as the citizen route, different payload.</div>
+          <div class="detail">
+            <ul>
+              <li>Returns the prompt, voice, keyterms, greeting, and model alongside the token.</li>
+              <li>Protocol lives in one shared file; personality lives in the route. That's the whole split.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">/v1/auth/grant</span></div>
+
+        <div class="node" data-zone="deepgram">
+          <div class="ttl">Deepgram auth<span class="caret">▸</span></div>
+          <div class="file">short-lived JWT</div>
+          <div class="sub">The only credential that reaches the page.</div>
+          <div class="detail">Needs a Member or Owner key. A restricted one passes every other Deepgram call and 403s here.</div>
+        </div>
+      </div>
+
+      <div class="boundary">DEEPGRAM_API_KEY stops here: only the JWT reaches the browser</div>
+
+      <div class="flow-title">The live session</div>
+      <div class="flow">
+        <div class="node" data-zone="browser">
+          <div class="ttl">useVoiceAgent<span class="caret">▸</span></div>
+          <div class="file">components/city/useVoiceAgent.ts <span class="loc">539</span></div>
+          <div class="sub">The same transport the citizens use: socket, mic, playback.</div>
+          <div class="detail">
+            <ul>
+              <li>Nothing here knows which agent it's carrying. Both get subprotocol auth, snake_case settings, barge-in, and paced transcript reveal for free.</li>
+              <li>Mute, KeepAlive, and the visualizer all behave identically in both tabs.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link strong"><span class="glyph">↔</span><span class="proto">WebSocket<br/>16 / 24 kHz PCM</span></div>
+
+        <div class="node" data-zone="deepgram">
+          <div class="ttl">Voice Agent API<span class="caret">▸</span></div>
+          <div class="file">agent.deepgram.com/v1/agent/converse</div>
+          <div class="sub">Flux STT → <code>claude-sonnet-5</code> → <code>aura-2-apollo-en</code>.</div>
+          <div class="detail">
+            <ul>
+              <li>Deepgram runs transcription, the model, speech, turn detection and barge-in. We only move audio.</li>
+              <li>Fixed voice, unlike the citizens' hashed pick, because the Mayor is one character.</li>
+              <li>No <code>functions</code> key, so the agent has no tools and can never touch the city.</li>
+              <li>No Opus available: the think provider lists four Anthropic models, topping out at Sonnet 5. Reaching Opus would mean a custom endpoint or owning the loop, and losing turn detection and barge-in.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link strong"><span class="glyph">→</span><span class="proto">audio envelope</span></div>
+
+        <div class="node" data-zone="browser">
+          <div class="ttl">Portrait<span class="caret">▸</span></div>
+          <div class="file">components/city/MayorDebrief.tsx <span class="loc">168</span></div>
+          <div class="sub">Cross-fades the mouth open and shut with the audio.</div>
+          <div class="detail">
+            <ul>
+              <li>Driven by the same analyser that feeds the citizens' visualizer, so the mouth moves only on real speech.</li>
+              <li>The two images are a registered pair: only 0.08% of pixels differ, all around the mouth.</li>
+              <li>Both are sized by width so they stay aligned, and both stay mounted so nothing loads mid-sentence.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================================================== SCHEMA -->
+    <section class="panel" id="panel-schema">
+      <div class="panel-hd">
+        <h2>Schema</h2>
+        <p>
+          <code>lib/all_types.tsx</code> is the source of truth. Everything else reads it: the agent tools
+          validate against it, the renderer draws from it, the simulation mutates it, and localStorage
+          serialises it. 787 lines, no dependencies.
+        </p>
+      </div>
+
+      <div class="flow-title">A grid and three lists</div>
+      <div class="flow">
+        <div class="node" data-zone="data">
+          <div class="ttl">City<span class="caret">▸</span></div>
+          <div class="file">type City</div>
+          <div class="sub">The whole world in one plain object.</div>
+          <div class="detail">
+            <ul>
+              <li>Separating the ground layer from the object lists is what makes rect fills cheap and object lookups direct.</li>
+              <li><code>day</code> runs 1 to 7.</li>
+              <li><code>initCity(size)</code> defaults to 500 and fills every cell with grass.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">·</span></div>
+
+        <div class="node" data-zone="data">
+          <div class="ttl">tile_grid<span class="caret">▸</span></div>
+          <div class="file">TileCode[][]</div>
+          <div class="sub">Ground layer, one char per cell.</div>
+          <div class="detail">Row-major, indexed <code>[y][x]</code>. Storing single chars is what makes the ASCII view a straight join instead of a conversion.</div>
+        </div>
+
+        <div class="link"><span class="glyph">·</span></div>
+
+        <div class="node" data-zone="data">
+          <div class="ttl">all_properties<span class="caret">▸</span></div>
+          <div class="file">Property[]</div>
+          <div class="sub">Buildings, anchored at their top corner.</div>
+          <div class="detail">A building is one entry with a width and height, not N grid cells. <code>getPropertyAt</code> and <code>deletePropertyAt</code> match against the whole footprint.</div>
+        </div>
+
+        <div class="link"><span class="glyph">·</span></div>
+
+        <div class="node" data-zone="data">
+          <div class="ttl">all_nature<span class="caret">▸</span></div>
+          <div class="file">Nature[]</div>
+          <div class="sub">Trees, flower patches, bushes. All 1x1.</div>
+          <div class="detail">Just a name, a position and an image. Nature blocks walkability but has no other behaviour.</div>
+        </div>
+
+        <div class="link"><span class="glyph">·</span></div>
+
+        <div class="node" data-zone="data">
+          <div class="ttl">all_citizens<span class="caret">▸</span></div>
+          <div class="file">Person[]</div>
+          <div class="sub">Empty until the simulation starts.</div>
+          <div class="detail">Populated by <code>spawning.ts</code>, cleared by <code>stopSim()</code>. This is why the report uses <code>endSim()</code> instead.</div>
+        </div>
+      </div>
+
+      <div class="flow-title">Tiles: the walkable / drivable matrix</div>
+      <div class="tbl">
+        <table>
+          <thead>
+            <tr><th>Tile</th><th>Code</th><th>Walkable</th><th>Drivable</th><th>Note</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>grass</td><td><code>.</code></td><td>yes</td><td>no</td><td>Default fill. The only surface buildings may be placed on.</td></tr>
+            <tr><td>pavement</td><td><code>,</code></td><td>yes</td><td>no</td><td>Decorative ground.</td></tr>
+            <tr><td>sidewalk</td><td><code>_</code></td><td>yes</td><td>no</td><td>Laid across a road, it severs the driving network.</td></tr>
+            <tr><td>crosswalk</td><td><code>x</code></td><td>yes</td><td>yes</td><td><b>The only tile that is both.</b> Every road crossing has to be this.</td></tr>
+            <tr><td>road_one_way</td><td><code>-</code></td><td>no</td><td>yes</td><td>Citizens cannot walk on roads.</td></tr>
+            <tr><td>road_two_way</td><td><code>=</code></td><td>no</td><td>yes</td><td>Shares an image with one-way.</td></tr>
+            <tr><td>road_intersection</td><td><code>+</code></td><td>no</td><td>yes</td><td>Junction sprite.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout green">
+        <span class="tag">Why this table is the important one</span>
+        <code>TILE_META</code> holds two booleans per tile, and those two booleans generate both grids the
+        A* search runs on: walkability for citizens, drivability for fire trucks. Crosswalk being the only
+        row with both set true is the entire reason the Mayor prompt has a rule about crossings.
+      </div>
+
+      <div class="flow-title">Properties: 13 types, all defaults in one table</div>
+      <div class="tbl">
+        <table>
+          <thead>
+            <tr><th>Property</th><th>Code</th><th>Size</th><th>Enter</th><th>Cap</th><th>Boredom</th><th>Hunger</th><th>Tiredness</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>house</td><td><code>D</code></td><td>2x2</td><td>yes</td><td>4</td><td>2</td><td>5</td><td>10</td></tr>
+            <tr><td>apartment</td><td><code>A</code></td><td>3x3</td><td>yes</td><td>10</td><td>2</td><td>5</td><td>10</td></tr>
+            <tr><td>restaurant</td><td><code>R</code></td><td>2x2</td><td>yes</td><td>30</td><td>5</td><td>10</td><td>0</td></tr>
+            <tr><td>grocery_store</td><td><code>G</code></td><td>3x3</td><td>yes</td><td>30</td><td>2</td><td>8</td><td>0</td></tr>
+            <tr><td>theme_park</td><td><code>Z</code></td><td>3x3</td><td>yes</td><td>60</td><td>10</td><td>2</td><td>0</td></tr>
+            <tr><td>park</td><td><code>P</code></td><td>3x3</td><td>yes</td><td>50</td><td>8</td><td>0</td><td>3</td></tr>
+            <tr><td>shopping_mall</td><td><code>M</code></td><td>3x3</td><td>yes</td><td>40</td><td>6</td><td>6</td><td>0</td></tr>
+            <tr><td>office</td><td><code>O</code></td><td>3x3</td><td>yes</td><td>30</td><td>3</td><td>0</td><td>0</td></tr>
+            <tr><td>school</td><td><code>S</code></td><td>3x3</td><td>yes</td><td>80</td><td>3</td><td>0</td><td>0</td></tr>
+            <tr><td>hospital</td><td><code>H</code></td><td>3x3</td><td>yes</td><td>20</td><td>0</td><td>0</td><td>5</td></tr>
+            <tr><td>fire_station</td><td><code>F</code></td><td>3x3</td><td>no</td><td>10</td><td>0</td><td>0</td><td>0</td></tr>
+            <tr><td>police_station</td><td><code>C</code></td><td>3x3</td><td>no</td><td>10</td><td>0</td><td>0</td><td>0</td></tr>
+            <tr><td>power_plant</td><td><code>E</code></td><td>3x3</td><td>no</td><td>5</td><td>0</td><td>0</td><td>0</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout">
+        <span class="tag">One consequence worth reading off this table</span>
+        A house restores tiredness <b>10</b> and a hospital only <b>5</b>, so sleeping at home is always the
+        right move. That is why tiredness is excluded from the unmet-wants check: left in, "no public place
+        serves tiredness" fired in every city that had no hospital, which is not a planning problem.
+      </div>
+
+      <div class="flow-title">Person and its sub-records</div>
+      <div class="flow">
+        <div class="node" data-zone="data">
+          <div class="ttl">Person<span class="caret">▸</span></div>
+          <div class="file">type Person</div>
+          <div class="sub">Identity, needs, position, and an append-only history.</div>
+          <div class="detail">
+            <ul>
+              <li>Three needs on a 1 to 10 scale, each with its own per-person decay rate drawn at spawn.</li>
+              <li>Every adult is an engineer; <code>job</code> holds the company name, matching an office's <code>company_name</code>. Children get <code>null</code>.</li>
+              <li>Four render-only fields (<code>prev_location</code>, <code>tick_path</code>, <code>visual_position</code>) let the renderer lerp between cells without the sim knowing about frames.</li>
+              <li><code>gender</code> is optional because saves predate it. Always read it through <code>citizenGender()</code>, which falls back to a name hash.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">·</span><span class="proto">trips[]</span></div>
+
+        <div class="node" data-zone="data">
+          <div class="ttl">Trip<span class="caret">▸</span></div>
+          <div class="file">type Trip</div>
+          <div class="sub">Where they went, how far, and when they arrived.</div>
+          <div class="detail">
+            <ul>
+              <li><code>distance_tiles</code> doubles as duration, since a citizen advances one cell per tick.</li>
+              <li>A missing <code>arrived_tick</code> means in progress <b>or</b> abandoned, so walkability stats filter on it being present.</li>
+              <li>This log is what grounds the citizen interviews. Without it they would invent their own history.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">·</span><span class="proto">unmet_wants[]</span></div>
+
+        <div class="node" data-zone="data">
+          <div class="ttl">UnmetWant<span class="caret">▸</span></div>
+          <div class="file">type UnmetWant</div>
+          <div class="sub">The trips that never happened.</div>
+          <div class="detail">
+            <ul>
+              <li><code>no_option</code>: nothing in the city serves that need. Build something.</li>
+              <li><code>unreachable</code>: it exists but there is no walkable route. Fix the roads.</li>
+              <li>Deduped by (need, reason) with <code>first_tick</code>, <code>last_tick</code> and a count, because idle citizens re-decide every tick.</li>
+              <li>Also optional, for the same back-compat reason as <code>gender</code>. Read as <code>?? []</code>.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-title">Helpers, and who reads the schema</div>
+      <div class="flow">
+        <div class="node" data-zone="data">
+          <div class="ttl">Mutators<span class="caret">▸</span></div>
+          <div class="file">placeTile · placeTileRect · placeProperty · placeNature</div>
+          <div class="sub">They throw rather than clamp.</div>
+          <div class="detail">
+            <ul>
+              <li><code>placeTileRect</code> throws on out of bounds; <code>placeProperty</code> throws on overlap or out of bounds.</li>
+              <li>Failing loudly is what lets the agent tool layer report a real error back to the model instead of silently placing nothing.</li>
+              <li><code>deletePropertyAt</code> matches any cell of a footprint, not just the anchor.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">↔</span><span class="proto">round trip</span></div>
+
+        <div class="node" data-zone="data">
+          <div class="ttl">ASCII view<span class="caret">▸</span></div>
+          <div class="file">cityToAscii · asciiToCity · ASCII_LEGEND</div>
+          <div class="sub">The compact form agents read.</div>
+          <div class="detail">
+            <ul>
+              <li>Buildings and nature are painted over the ground grid, so one char per cell shows everything.</li>
+              <li>Not lossless: ASCII drops sprite variants, so <code>asciiToCity</code> takes a strategy of <code>'default'</code> or <code>'random'</code>.</li>
+              <li>Use <code>'default'</code> anywhere that runs during render, or the variants differ between server and client.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span><span class="proto">consumed by</span></div>
+
+        <div class="node" data-zone="server">
+          <div class="ttl">Agent side<span class="caret">▸</span></div>
+          <div class="file">lib/agent/{tools,observation}.ts</div>
+          <div class="sub">Validates tool calls, and renders the city as text.</div>
+          <div class="detail">The grass-only rule is enforced here, against <code>TILE_META</code> and the property footprints.</div>
+        </div>
+
+        <div class="link"><span class="glyph">→</span></div>
+
+        <div class="node" data-zone="browser">
+          <div class="ttl">Client side<span class="caret">▸</span></div>
+          <div class="file">useCityScene.ts · cityStore.ts · renderConfig.ts</div>
+          <div class="sub">Draws it, saves it, and offsets the sprites.</div>
+          <div class="detail">Image arrays live in the schema file, but the variant roulette runs in the browser so the same city can look different across loads.</div>
+        </div>
+      </div>
+
+      <div class="callout amber">
+        <span class="tag">Two rules the schema enforces by construction</span>
+        <b>No <code>Math.random()</code> at module level</b>, or server and client disagree on sprite
+        variants and React throws a hydration mismatch. Variant picking happens in effects and event
+        handlers only. And <b>new fields are added optional</b>, since cities in localStorage predate them:
+        <code>gender</code> and <code>unmet_wants</code> both went in that way.
+      </div>
+    </section>
+
+    <!-- ================================================== FOUNDATION -->
+    <section class="panel" id="panel-foundation">
+      <div class="panel-hd">
+        <h2>Foundation</h2>
+        <p>Shared by all four stages: the schema everything reads, plus persistence and rendering setup.</p>
+      </div>
+
+      <div class="flow-title">Shared modules</div>
+      <div class="flow">
+        <div class="node" data-zone="data">
+          <div class="ttl">Schema<span class="caret">▸</span></div>
+          <div class="file">lib/all_types.tsx <span class="loc">787</span></div>
+          <div class="sub">City, Property, Nature, Person, and the helpers.</div>
+          <div class="detail">
+            <ul>
+              <li>A tile grid plus three lists: properties, nature, citizens.</li>
+              <li>Helpers throw instead of clamping, so overlap and out-of-bounds are errors.</li>
+              <li>No <code>Math.random()</code> at module level, to avoid hydration mismatches.</li>
+              <li>13 property types. The grid is 50×50 for the demo but the schema goes to 500.</li>
+            </ul>
+          </div>
+        </div>
+        <div class="link"><span class="glyph">·</span></div>
+        <div class="node" data-zone="browser">
+          <div class="ttl">Persistence<span class="caret">▸</span></div>
+          <div class="file">lib/cityStore.ts <span class="loc">120</span></div>
+          <div class="sub">localStorage save and load.</div>
+          <div class="detail">
+            <div class="files">
+              <span>app/cities/page.tsx (127)</span>
+              <span>app/cities/[id]/page.tsx (70), editable</span>
+            </div>
+          </div>
+        </div>
+        <div class="link"><span class="glyph">·</span></div>
+        <div class="node" data-zone="browser">
+          <div class="ttl">Sprite config<span class="caret">▸</span></div>
+          <div class="file">lib/renderConfig.ts <span class="loc">56</span></div>
+          <div class="sub">Per-sprite offset and scale.</div>
+          <div class="detail">Alignment lives here, so nudging a sprite never touches the schema or the renderer.</div>
+        </div>
+        <div class="link"><span class="glyph">·</span></div>
+        <div class="node" data-zone="browser">
+          <div class="ttl">Scene helpers<span class="caret">▸</span></div>
+          <div class="file">components/city/{constants,imageHelpers,hitTesting}.ts</div>
+          <div class="sub">Tile maths, variant picking, hit testing.</div>
+          <div class="detail">
+            <div class="files">
+              <span>constants.ts: tile size, gridToScreen</span>
+              <span>imageHelpers.ts: variants, preload (92)</span>
+              <span>hitTesting.ts: screenToGrid, entityAt (93)</span>
+              <span>paletteData.ts + Palette.tsx</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-title">Mounting the canvas</div>
+      <div class="flow">
+        <div class="node" data-zone="server">
+          <div class="ttl">page.tsx<span class="caret">▸</span></div>
+          <div class="file">app/page.tsx <span class="loc">38</span></div>
+          <div class="sub">Server component entry.</div>
+          <div class="detail">Can't use <code>ssr: false</code> itself, which is what the wrapper is for.</div>
+        </div>
+        <div class="link"><span class="glyph">→</span></div>
+        <div class="node" data-zone="browser">
+          <div class="ttl">Wrapper<span class="caret">▸</span></div>
+          <div class="file">components/CityRendererWrapper.tsx</div>
+          <div class="sub"><code>'use client'</code> + <code>dynamic(…, { ssr: false })</code>.</div>
+          <div class="detail">Exists only to hold the dynamic import, since Pixi needs a real DOM at import time.</div>
+        </div>
+        <div class="link"><span class="glyph">→</span></div>
+        <div class="node" data-zone="browser">
+          <div class="ttl">CityRenderer<span class="caret">▸</span></div>
+          <div class="file">components/CityRenderer.tsx <span class="loc">523</span></div>
+          <div class="sub">Composes the three hooks and assembles the UI.</div>
+          <div class="detail">Owns the mount ref, the city ref, the grid toggle, and the chat window position.</div>
+        </div>
+      </div>
+
+      <div class="callout">
+        <span class="tag">Hook order matters</span>
+        <code>useCityEditor</code> runs first to create the refs, then <code>useCityScene</code> receives
+        them, then <code>bindScene()</code> threads the scene's outputs back. Reversing that leaves the
+        editor holding refs the scene never filled.
+      </div>
+    </section>
+
+    <!-- ================================================== AGENTS -->
+    <section class="panel" id="panel-agents">
+      <div class="panel-hd">
+        <h2>Agents</h2>
+        <p>Four agents across two providers. Only the build-phase Mayor has tools worth speaking of.</p>
+      </div>
+
+      <div class="tbl">
+        <table>
+          <thead>
+            <tr><th>Agent</th><th>Model</th><th>Runtime</th><th>Tools</th><th>Thinking</th><th>Defined in</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>Mayor</b> (build)</td>
+              <td><code>claude-opus-5</code></td>
+              <td>Direct loop, effort low</td>
+              <td>14</td>
+              <td>adaptive, can't be off</td>
+              <td><code>lib/agent/mayor.ts</code></td>
+            </tr>
+            <tr>
+              <td><b>Zone</b> ×4-8</td>
+              <td><code>claude-haiku-4-5</code></td>
+              <td>Managed Agents</td>
+              <td>7</td>
+              <td>forced on</td>
+              <td><code>lib/agent/zone.ts</code></td>
+            </tr>
+            <tr>
+              <td><b>Citizen</b></td>
+              <td><code>claude-haiku-4-5</code></td>
+              <td>Messages API and Deepgram</td>
+              <td>0</td>
+              <td>off</td>
+              <td><code>lib/agent/citizenPrompt.ts</code></td>
+            </tr>
+            <tr>
+              <td><b>Mayor debrief</b></td>
+              <td><code>claude-sonnet-5</code></td>
+              <td>Deepgram</td>
+              <td>0</td>
+              <td>off</td>
+              <td><code>lib/agent/mayorDebriefPrompt.ts</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="flow-title">The two Mayors</div>
+      <div class="flow">
+        <div class="node" data-zone="server">
+          <div class="ttl">Build Mayor<span class="caret">▸</span></div>
+          <div class="file">lib/agent/mayor.ts <span class="loc">1408</span></div>
+          <div class="sub">Lays roads, delegates zones, mutates the city.</div>
+          <div class="detail">
+            <ul>
+              <li>First build must delegate; follow-ups can edit directly.</li>
+              <li>Small edits skip delegation entirely.</li>
+            </ul>
+          </div>
+        </div>
+        <div class="link"><span class="glyph">·</span><span class="proto">separate<br/>modules</span></div>
+        <div class="node" data-zone="data">
+          <div class="ttl">Debrief Mayor<span class="caret">▸</span></div>
+          <div class="file">lib/agent/mayorDebriefPrompt.ts <span class="loc">250</span></div>
+          <div class="sub">No tools, never touches the city.</div>
+          <div class="detail">Kept in a separate module so the two prompts can't drift into each other.</div>
+        </div>
+        <div class="link"><span class="glyph">·</span><span class="proto">shared by<br/>citizen + mayor</span></div>
+        <div class="node" data-zone="browser">
+          <div class="ttl">One voice transport<span class="caret">▸</span></div>
+          <div class="file">components/city/useVoiceAgent.ts <span class="loc">539</span></div>
+          <div class="sub">Both voice agents run through it.</div>
+          <div class="detail">They differ only in the config the token route returns: prompt, voice, keyterms, greeting, model.</div>
+        </div>
+      </div>
+
+      <div class="callout amber">
+        <span class="tag">Known limits</span>
+        No reconnect mid-build: the server finishes, but the browser can't re-attach. Zones aren't
+        interruptible from the UI. Single-user demo, since sessions live in a per-process Map. Interrupts
+        land at turn boundaries.
+      </div>
+    </section>
+
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var viewport = document.getElementById('viewport');
+  var canvas   = document.getElementById('canvas');
+  var zoomVal  = document.getElementById('zoomVal');
+  var tabs     = Array.prototype.slice.call(document.querySelectorAll('.tab'));
+  var panels   = Array.prototype.slice.call(document.querySelectorAll('.panel'));
+
+  var MIN = 0.25, MAX = 2.5, PAD = 28;
+
+  // Camera per tab, so switching back returns you where you were.
+  var cams = {};
+  var current = 'build';
+
+  function cam() { return cams[current]; }
+  function clamp(s) { return Math.max(MIN, Math.min(MAX, s)); }
+
+  function draw() {
+    var c = cam();
+    canvas.style.transform = 'translate(' + c.x + 'px,' + c.y + 'px) scale(' + c.s + ')';
+    zoomVal.textContent = Math.round(c.s * 100) + '%';
+  }
+
+  function activePanel() { return document.getElementById('panel-' + current); }
+
+  function fit() {
+    var p = activePanel();
+    var vw = viewport.clientWidth, vh = viewport.clientHeight;
+    // offsetWidth/Height are layout sizes, unaffected by the parent transform.
+    var w = p.offsetWidth, h = p.offsetHeight;
+    var s = clamp(Math.min((vw - PAD * 2) / w, (vh - PAD * 2) / h, 1));
+    cams[current] = {
+      x: Math.max(PAD, (vw - w * s) / 2),
+      y: h * s < vh - PAD * 2 ? (vh - h * s) / 2 : PAD,
+      s: s
+    };
+    draw();
+  }
+
+  function zoomAt(px, py, factor) {
+    var c = cam();
+    var ns = clamp(c.s * factor);
+    if (ns === c.s) return;
+    // Keep the point under the cursor fixed.
+    c.x = px - (px - c.x) * (ns / c.s);
+    c.y = py - (py - c.y) * (ns / c.s);
+    c.s = ns;
+    draw();
+  }
+
+  function zoomCentre(factor) {
+    zoomAt(viewport.clientWidth / 2, viewport.clientHeight / 2, factor);
+  }
+
+  // ---- tabs -------------------------------------------------------------
+  function selectTab(name) {
+    current = name;
+    tabs.forEach(function (t) {
+      t.setAttribute('aria-selected', t.getAttribute('data-panel') === name ? 'true' : 'false');
+    });
+    panels.forEach(function (p) { p.classList.toggle('active', p.id === 'panel-' + name); });
+    // Panel must be visible before it can be measured.
+    if (!cams[name]) fit(); else draw();
+  }
+
+  tabs.forEach(function (t) {
+    t.addEventListener('click', function () { selectTab(t.getAttribute('data-panel')); });
+  });
+
+  // ---- pan --------------------------------------------------------------
+  var pointers = new Map();
+  var panning = false, moved = false;
+  var last = { x: 0, y: 0 };
+  var pinch = null;
+
+  function localPoint(e) {
+    var r = viewport.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  viewport.addEventListener('pointerdown', function (e) {
+    pointers.set(e.pointerId, localPoint(e));
+    viewport.setPointerCapture(e.pointerId);
+
+    if (pointers.size === 1) {
+      panning = true; moved = false;
+      last = localPoint(e);
+    } else if (pointers.size === 2) {
+      panning = false;
+      var pts = Array.from(pointers.values());
+      pinch = {
+        dist: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y),
+        mid: { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 }
+      };
+    }
+  });
+
+  viewport.addEventListener('pointermove', function (e) {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, localPoint(e));
+
+    if (pointers.size === 2 && pinch) {
+      var pts = Array.from(pointers.values());
+      var d = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      var mid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+      if (pinch.dist > 0) zoomAt(mid.x, mid.y, d / pinch.dist);
+      // Two-finger drag pans as well as pinches.
+      var c = cam();
+      c.x += mid.x - pinch.mid.x;
+      c.y += mid.y - pinch.mid.y;
+      pinch.dist = d; pinch.mid = mid;
+      moved = true;
+      draw();
+      return;
+    }
+
+    if (!panning) return;
+    var p = localPoint(e);
+    var dx = p.x - last.x, dy = p.y - last.y;
+    if (!moved && Math.hypot(dx, dy) < 4) return;   // let small jitters still count as a click
+    if (!moved) { moved = true; viewport.classList.add('grabbing'); }
+    var c2 = cam();
+    c2.x += dx; c2.y += dy;
+    last = p;
+    draw();
+  });
+
+  function endPointer(e) {
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) pinch = null;
+    if (pointers.size === 0) {
+      panning = false;
+      viewport.classList.remove('grabbing');
+      // `moved` deliberately stays true until the next pointerdown resets it,
+      // that's what suppresses the click a drag would otherwise fire.
+    }
+  }
+  viewport.addEventListener('pointerup', endPointer);
+  viewport.addEventListener('pointercancel', endPointer);
+
+  // ---- wheel zoom -------------------------------------------------------
+  viewport.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    var p = localPoint(e);
+    // Trackpad pinch arrives as ctrl+wheel; give it a stronger response.
+    var k = e.ctrlKey ? 0.01 : 0.0015;
+    zoomAt(p.x, p.y, Math.exp(-e.deltaY * k));
+  }, { passive: false });
+
+  // ---- cards ------------------------------------------------------------
+  var nodes = Array.prototype.slice.call(document.querySelectorAll('.node'));
+
+  function setOpen(node, open) {
+    node.classList.toggle('open', open);
+    node.setAttribute('aria-expanded', open ? 'true' : 'false');
+    var caret = node.querySelector('.caret');
+    if (caret) caret.textContent = open ? '▾' : '▸';
+  }
+
+  nodes.forEach(function (node) {
+    if (!node.querySelector('.detail')) return;
+    node.setAttribute('tabindex', '0');
+    node.setAttribute('role', 'button');
+    node.setAttribute('aria-expanded', 'false');
+
+    node.addEventListener('click', function (e) {
+      if (moved) return;                                    // that was a pan, not a click
+      e.stopPropagation();
+      setOpen(node, !node.classList.contains('open'));
+    });
+    node.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        setOpen(node, !node.classList.contains('open'));
+      }
+    });
+  });
+
+  function setAll(open) {
+    nodes.forEach(function (n) { if (n.querySelector('.detail')) setOpen(n, open); });
+  }
+  document.getElementById('expandAll').addEventListener('click', function () { setAll(true); });
+  document.getElementById('collapseAll').addEventListener('click', function () { setAll(false); });
+
+  // ---- zone filter ------------------------------------------------------
+  var chips  = Array.prototype.slice.call(document.querySelectorAll('.chip'));
+  var links  = Array.prototype.slice.call(document.querySelectorAll('.link'));
+  var stacks = Array.prototype.slice.call(document.querySelectorAll('.stack'));
+  var active = Object.create(null);
+
+  function applyFilter() {
+    var on = Object.keys(active).length > 0;
+    document.body.classList.toggle('filtering', on);
+
+    nodes.forEach(function (n) {
+      n.classList.toggle('dim', on && !active[n.getAttribute('data-zone')]);
+    });
+    stacks.forEach(function (s) {
+      s.classList.toggle('dim', on && !active[s.getAttribute('data-zone')]);
+    });
+    // A connector stays lit only when both ends survived.
+    links.forEach(function (l) {
+      if (!on) { l.classList.remove('dim'); return; }
+      var live = function (el) { return el && !el.classList.contains('dim'); };
+      l.classList.toggle('dim', !(live(l.previousElementSibling) && live(l.nextElementSibling)));
+    });
+  }
+
+  chips.forEach(function (chip) {
+    chip.addEventListener('click', function () {
+      var zone = chip.getAttribute('data-zone');
+      if (active[zone]) delete active[zone]; else active[zone] = true;
+      chip.setAttribute('aria-pressed', active[zone] ? 'true' : 'false');
+      applyFilter();
+    });
+  });
+
+  // ---- buttons and keys -------------------------------------------------
+  document.getElementById('zoomIn').addEventListener('click', function () { zoomCentre(1.2); });
+  document.getElementById('zoomOut').addEventListener('click', function () { zoomCentre(1 / 1.2); });
+  document.getElementById('fitBtn').addEventListener('click', fit);
+
+  document.addEventListener('keydown', function (e) {
+    if (e.target && /^(INPUT|TEXTAREA)$/.test(e.target.tagName)) return;
+
+    if (e.key === 'Escape') {
+      active = Object.create(null);
+      chips.forEach(function (c) { c.setAttribute('aria-pressed', 'false'); });
+      applyFilter();
+      return;
+    }
+    if (e.key === '+' || e.key === '=') { zoomCentre(1.2); return; }
+    if (e.key === '-' || e.key === '_') { zoomCentre(1 / 1.2); return; }
+    if (e.key === '0') { fit(); return; }
+
+    // Number keys jump between tabs.
+    var n = parseInt(e.key, 10);
+    if (n >= 1 && n <= tabs.length) selectTab(tabs[n - 1].getAttribute('data-panel'));
+  });
+
+  // Re-fit only the tabs the user hasn't framed themselves.
+  var resizeTimer;
+  window.addEventListener('resize', function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+      Object.keys(cams).forEach(function (k) { if (!cams[k].touched) delete cams[k]; });
+      if (!cams[current]) fit(); else draw();
+    }, 150);
+  });
+
+  // Mark a camera as user-framed so resize leaves it alone.
+  ['pointerdown', 'wheel'].forEach(function (ev) {
+    viewport.addEventListener(ev, function () { if (cam()) cam().touched = true; }, { passive: true });
+  });
+
+  fit();
+})();
+</script>
+</body>
+</html>
